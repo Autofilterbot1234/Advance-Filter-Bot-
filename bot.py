@@ -2,7 +2,7 @@
 # ----------------------------------------------------
 # Developed by: Ctgmovies23
 # Project: TGLinkBase Auto Filter Bot (Ultimate Edition)
-# Version: 5.2 (Dynamic Verification Steps Added)
+# Version: 5.3 (Fixed KeyError: chat_id for Old Database)
 # Features:
 #   - Auto Filter (MongoDB)
 #   - Multi-Channel Indexing (ID Batch Fetching)
@@ -178,7 +178,6 @@ async def init_settings():
         await settings_col.update_one({"key": "protect_content"}, {"$setOnInsert": {"value": True}}, upsert=True)
         await settings_col.update_one({"key": "verification_mode"}, {"$setOnInsert": {"value": True}}, upsert=True)
         await settings_col.update_one({"key": "global_notify"}, {"$setOnInsert": {"value": True}}, upsert=True)
-        # UPDATE: ডিফল্ট স্টেপ ২ সেট করা হলো
         await settings_col.update_one({"key": "verify_max_steps"}, {"$setOnInsert": {"value": 2}}, upsert=True)
     except Exception as e:
         logger.error(f"Settings Init Error: {e}")
@@ -389,9 +388,9 @@ async def delete_message_later(chat_id, message_id, delay=300):
 async def create_verification_link(message_id, user_id):
     token = secrets.token_urlsafe(16)
     
-    # Need to fetch the movie to get correct chat_id
+    # Fix: Use .get() to avoid KeyError for old database entries
     movie = await movies_col.find_one({"message_id": message_id})
-    chat_id = movie["chat_id"] if movie else CHANNEL_ID
+    chat_id = movie.get("chat_id", CHANNEL_ID) if movie else CHANNEL_ID
 
     await verify_col.insert_one({
         "token": token,
@@ -454,8 +453,6 @@ def find_corrected_matches(query_clean, all_movie_titles_data, score_cutoff=80, 
 async def process_movie_save(message):
     """
     Parses a message and saves it to the database.
-    Ensures 'Same to Same' copy by saving the ID and extracting the Title from the first line.
-    Works for both Direct Files and Link Posts (Photos with Captions).
     """
     text = message.caption or message.text
     if not text: 
@@ -794,6 +791,7 @@ async def start(_, msg: Message):
                 return
 
             message_id = verify_data["movie_id"]
+            # Fix: Use .get() default to CHANNEL_ID if key missing in old verify data (rare but safe)
             source_chat_id = verify_data.get("chat_id", CHANNEL_ID)
 
             try:
@@ -822,7 +820,8 @@ async def start(_, msg: Message):
             message_id = int(argument.replace("watch_", ""))
             
             movie = await movies_col.find_one({"message_id": message_id})
-            source_chat_id = movie["chat_id"] if movie else CHANNEL_ID
+            # Fix: Use .get() to avoid KeyError if 'chat_id' is missing in old documents
+            source_chat_id = movie.get("chat_id", CHANNEL_ID) if movie else CHANNEL_ID
 
             verify_setting = await settings_col.find_one({"key": "verification_mode"})
             is_verify_on = verify_setting.get("value", True) if verify_setting else True
@@ -1404,7 +1403,7 @@ async def callback_handler(_, cq: CallbackQuery):
         logger.error(f"Callback Error: {e}")
 
 if __name__ == "__main__":
-    print("🚀 Bot Started (Ultimate Version with Dynamic Verification)...")
+    print("🚀 Bot Started (Ultimate Version with Key Fixes)...")
     Thread(target=run_flask).start() # Start Flask Web Server
     app.loop.create_task(init_settings()) # Init Settings
     app.loop.create_task(auto_group_messenger()) # Start Auto Msg
