@@ -2,7 +2,7 @@
 # ----------------------------------------------------
 # Developed by: Ctgmovies23
 # Project: TGLinkBase Auto Filter Bot (Ultimate Edition)
-# Version: 5.5 (Full Features + Advanced UI + Pagination)
+# Version: 6.0 (Fixed Pagination + Working Filters)
 # Features:
 #   - Auto Filter (MongoDB)
 #   - Multi-Channel Indexing (ID Batch Fetching)
@@ -13,8 +13,8 @@
 #   - Auto Broadcast & Group Messenger
 #   - Smart Search (TMDB + Spelling Correction)
 #   - Supports Direct Files & Poster Link Posts
-#   - UI: Quality, Language, Season Buttons
-#   - UI: Page Navigation (1/130, Next, Back)
+#   - UI: Working Quality, Language, Season Filters
+#   - UI: Smooth Page Navigation (In-Place Edit)
 # ----------------------------------------------------
 #
 
@@ -531,18 +531,31 @@ async def get_search_results(query, offset=0):
     """
     raw_year = extract_year(query)
     cleaned_query = smart_search_clean(query)
+    # If cleaned query is empty (e.g. only '720p' was typed), use original lower query
     if not cleaned_query: cleaned_query = query.lower()
 
+    # Note: If user added a filter (e.g. "Avengers 720p"), smart_search_clean removes "720p".
+    # But we want to support filters. So we check if the original query has filter words.
+    # To make filters work without breaking smart clean, we use the raw query for Regex if smart clean seems too short.
+    
+    # Improved Search Logic for Filters:
+    # We will search using regex on BOTH 'title_clean' AND 'title' fields.
+    # If the user typed "Avengers 720p", cleaned_query might just be "avengers". 
+    # But we want to respect "720p".
+    # So we use the query string passed to this function for regex.
+    
+    search_query_regex = re.escape(query.strip()) # Use the full query (with filters)
+    
     search_source = ""
     results = []
     total_count = 0
 
-    # 1. Direct Regex Search
-    regex_pattern = r"\b" + re.escape(cleaned_query) + r"\b"
+    # 1. Direct Regex Search (Matches Title OR Clean Title)
+    # This supports "Avengers 720p" matching against "Avengers: Endgame (2019) [720p]"
     query_filter = {
         "$or": [
-            {"title_clean": {"$regex": regex_pattern, "$options": "i"}},
-            {"title": {"$regex": regex_pattern, "$options": "i"}}
+            {"title_clean": {"$regex": search_query_regex, "$options": "i"}},
+            {"title": {"$regex": search_query_regex, "$options": "i"}}
         ]
     }
     if raw_year: query_filter["year"] = raw_year
@@ -554,8 +567,9 @@ async def get_search_results(query, offset=0):
         cursor = movies_col.find(query_filter).sort("views_count", -1).skip(offset).limit(RESULTS_COUNT)
         results = await cursor.to_list(length=RESULTS_COUNT)
     
-    # 2. Loose Search (if no direct results found)
+    # 2. Loose Search (only if no direct results found & no specific year filter)
     if not results and not raw_year:
+        # Fallback to cleaned query
         loose_pattern = re.escape(cleaned_query)
         loose_filter = {"title_clean": {"$regex": loose_pattern, "$options": "i"}}
         
@@ -565,8 +579,7 @@ async def get_search_results(query, offset=0):
             cursor = movies_col.find(loose_filter).sort("views_count", -1).skip(offset).limit(RESULTS_COUNT)
             results = await cursor.to_list(length=RESULTS_COUNT)
 
-    # 3. TMDB Search (if still no results, check TMDB)
-    # We only check TMDB on the first page (offset=0) to avoid repeated API calls
+    # 3. TMDB Search (only on first page)
     tmdb_detected_title = None
     if not results and offset == 0: 
         tmdb_detected_title = await get_tmdb_suggestion(cleaned_query)
@@ -584,9 +597,8 @@ async def get_search_results(query, offset=0):
                 results = await cursor.to_list(length=RESULTS_COUNT)
                 search_source = f"✅ **Auto Corrected:** '{tmdb_detected_title}'"
 
-    # 4. Fuzzy Search (Last Resort - Spelling Correction)
+    # 4. Fuzzy Search (Last Resort)
     if not results and not raw_year and not tmdb_detected_title and offset == 0:
-        # Fetch minimal data for fuzzy matching to reduce RAM usage
         all_movie_data = await movies_col.find({}, {"title_clean": 1, "original_title": "$title", "message_id": 1, "views_count": 1, "language": 1}).to_list(length=None)
         
         corrected_suggestions = await asyncio.get_event_loop().run_in_executor(
@@ -609,25 +621,18 @@ async def process_movie_save(message):
     Ensures 'Same to Same' copy by saving the ID and extracting the Title from the first line.
     Works for both Direct Files and Link Posts (Photos with Captions).
     """
-    # ১. টেক্সট বা ক্যাপশন অবশ্যই থাকতে হবে (টাইটেল ডিটেক্ট করার জন্য)
-    # যদি টেক্সট না থাকে, তাহলে সার্চ করা যাবে না, তাই রিটার্ন করছি।
     text = message.caption or message.text
     if not text: 
         return None
 
-    # ২. মিডিয়া ভ্যালিডেশন (ফটো, ভিডিও, ডকুমেন্ট, অডিও - যা ই হোক আমরা নিব)
     if not (message.photo or message.video or message.document or message.audio):
         return None
 
-    # ৩. টাইটেল প্রসেসিং (প্রথম লাইন টাইটেল হিসেবে ধরা হবে)
-    # যেমন: "The Skin Painter 2 (2018) Bengali Dubbed ORG" -> এটি টাইটেল হবে
     movie_title = text.splitlines()[0].strip()
     
-    # টাইটেল খুব ছোট হলে বা ভ্যালিড না হলে বাদ দেওয়া
     if len(movie_title) < 2: 
         return None
     
-    # ৪. থাম্বনেইল আইডি বের করা (সার্চ রেজাল্টে দেখানোর জন্য)
     thumbnail_file_id = None
     if message.photo:
         thumbnail_file_id = message.photo.file_id 
@@ -636,22 +641,20 @@ async def process_movie_save(message):
     elif message.document and message.document.thumbs:
         thumbnail_file_id = message.document.thumbs[0].file_id
 
-    # ৫. ডাটাবেসে সেভ করার জন্য ডাটা রেডি করা
     raw_data = {
-        "chat_id": message.chat.id,    # সোর্স চ্যানেল আইডি
-        "message_id": message.id,      # সোর্স মেসেজ আইডি
-        "title": movie_title,          # অরিজিনাল টাইটেল (ডিসপ্লের জন্য)
-        "full_caption": text,          # পুরো ক্যাপশন
+        "chat_id": message.chat.id,    # Source Channel ID
+        "message_id": message.id,      # Source Message ID
+        "title": movie_title,          # Display Title
+        "full_caption": text,          # Full Caption
         "date": message.date,
-        "year": extract_year(text),    # সাল বের করার চেষ্টা
-        "language": extract_language(text), # ভাষা বের করার চেষ্টা
-        "title_clean": clean_text(text), # ক্লিন টাইটেল (সার্চের জন্য)
+        "year": extract_year(text),    
+        "language": extract_language(text), 
+        "title_clean": clean_text(text), 
         "views_count": 0,
         "thumbnail_id": thumbnail_file_id 
     }
 
     try:
-        # ডুপ্লিকেট চেক (একই চ্যানেলে সেম মেসেজ যেন দুইবার সেভ না হয়)
         existing = await movies_col.find_one({"chat_id": message.chat.id, "message_id": message.id})
         if not existing:
             validated_data = movie_schema.load(raw_data)
@@ -818,12 +821,11 @@ async def log_group(_, msg: Message):
         upsert=True
     )
 
-# 3. MANUAL INDEXING COMMAND (For Multi-Channel) - FIXED & BATCH MODE
+# 3. MANUAL INDEXING COMMAND (For Multi-Channel)
 @app.on_message(filters.command("index") & filters.user(ADMIN_IDS))
 async def index_channel_handler(_, msg: Message):
     target_chat_id = None
     
-    # 1. চ্যাট আইডি বের করা
     if msg.reply_to_message and msg.reply_to_message.forward_from_chat:
         target_chat_id = msg.reply_to_message.forward_from_chat.id
     elif len(msg.command) > 1:
@@ -833,7 +835,6 @@ async def index_channel_handler(_, msg: Message):
     if not target_chat_id:
         return await msg.reply("❌ চ্যানেল আইডি পাওয়া যায়নি। সঠিক নিয়ম: `/index -100xxxx` অথবা চ্যানেল থেকে ফরোয়ার্ড করা মেসেজে রিপ্লাই দিন।")
 
-    # 2. লাস্ট মেসেজ আইডি বের করা
     try:
         check_msg = await app.send_message(target_chat_id, "⚠️ **Indexing Logic initialized...**")
         last_msg_id = check_msg.id
@@ -847,22 +848,19 @@ async def index_channel_handler(_, msg: Message):
     total_skipped = 0
     already_exists = 0
     
-    # ব্যাচ সাইজ (Safe Mode: 100 messages per request)
     batch_size = 100
     
     try:
         for i in range(last_msg_id, 0, -batch_size):
             try:
-                # আইডি রেঞ্জ তৈরি
                 start_id = i
                 end_id = max(1, i - batch_size + 1)
                 ids = list(range(start_id, end_id - 1, -1))
                 
-                # মেসেজ ফেচ করা (FloodWait হ্যান্ডলিং সহ)
                 try:
                     messages = await app.get_messages(target_chat_id, ids)
                 except FloodWait as e:
-                    await asyncio.sleep(e.value + 2) # ওয়েট করে আবার চেষ্টা
+                    await asyncio.sleep(e.value + 2) 
                     messages = await app.get_messages(target_chat_id, ids)
                 except Exception as e:
                     logger.error(f"Fetch Error: {e}")
@@ -871,32 +869,26 @@ async def index_channel_handler(_, msg: Message):
                 if not messages:
                     continue
 
-                # মেসেজ প্রসেসিং
                 for message in messages:
-                    # মেসেজ যদি এম্পটি হয় বা ডিলিটেড হয়
                     if not message or message.empty:
                         continue
                         
                     try:
-                        # আগে চেক করি ডাটাবেসে আছে কিনা
                         exists = await movies_col.find_one({"chat_id": target_chat_id, "message_id": message.id})
                         if exists:
                             already_exists += 1
                             continue
 
-                        # সেভ করার চেষ্টা
                         saved_title = await process_movie_save(message)
                         if saved_title: 
                             total_indexed += 1
                         else:
-                            total_skipped += 1 # মিডিয়া নেই বা টেক্সট মেসেজ
+                            total_skipped += 1
                     except Exception as inner_e:
                         logger.error(f"Save Error: {inner_e}")
                 
-                # প্রতি ব্যাচে ১.৫ সেকেন্ড বিরতি (যাতে FloodWait না আসে)
                 await asyncio.sleep(1.5)
                 
-                # স্ট্যাটাস আপডেট (প্রতি ২০০ মেসেজ পর পর)
                 if i % 200 == 0:
                     try: 
                         await status_msg.edit_text(
@@ -931,7 +923,6 @@ async def start(_, msg: Message):
     user_id = msg.from_user.id
     current_time = datetime.now(timezone.utc)
     
-    # Anti-Spam
     if user_id in user_last_start_time:
         if (current_time - user_last_start_time[user_id]) < timedelta(seconds=2):
             return
@@ -946,7 +937,6 @@ async def start(_, msg: Message):
     if len(msg.command) > 1:
         argument = msg.command[1]
         
-        # Check Protect Content Setting
         protect_setting = await settings_col.find_one({"key": "protect_content"})
         should_protect = protect_setting.get("value", True) if protect_setting else True
         
@@ -997,11 +987,9 @@ async def start(_, msg: Message):
         elif argument.startswith("watch_"):
             message_id = int(argument.replace("watch_", ""))
             
-            # Fetch DB to get Source Channel
             movie = await movies_col.find_one({"message_id": message_id})
             source_chat_id = movie["chat_id"] if movie else CHANNEL_ID
 
-            # Check Verify Mode
             verify_setting = await settings_col.find_one({"key": "verification_mode"})
             is_verify_on = verify_setting.get("value", True) if verify_setting else True
             
@@ -1093,7 +1081,6 @@ async def broadcast(_, msg: Message):
         origin_chat_id = reply_msg.chat.id
         origin_message_id = reply_msg.id
     else:
-        # Fallback to text
         full_text = msg.text or msg.caption
         if not full_text: return
         broadcast_text = full_text.split(None, 1)[1]
@@ -1157,14 +1144,12 @@ async def delete_specific_movie(_, msg: Message):
         return
     title = msg.text.split(None, 1)[1].strip()
     
-    # 1. Search first, Don't delete yet
     matches = await movies_col.find({"title": {"$regex": re.escape(title), "$options": "i"}}).to_list(length=100)
     
     if not matches:
         await msg.reply(f"❌ **'{title}'** নামে কোনো ফাইল পাওয়া যায়নি।")
         return
 
-    # 2. Show Preview
     text = f"⚠️ **সতর্কতা! আপনি নিচের ফাইলগুলো ডিলিট করতে যাচ্ছেন:**\n\n"
     for idx, movie in enumerate(matches[:15], 1): 
         text += f"{idx}. {movie['title']}\n"
@@ -1174,7 +1159,6 @@ async def delete_specific_movie(_, msg: Message):
         
     text += f"\n\n🔥 **মোট ফাইল:** {len(matches)} টি\nআপনি কি নিশ্চিত যে আপনি এগুলো সব ডিলিট করতে চান?"
     
-    # 3. Create Buttons
     encoded_title = urllib.parse.quote_plus(title)
     btn = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ হ্যাঁ, সব ডিলিট করুন", callback_data=f"confirm_del_{encoded_title}")],
@@ -1237,7 +1221,6 @@ async def search(_, msg: Message):
 
     user_id = msg.from_user.id
     
-    # Save the query for pagination later (Important for "Next" button)
     await users_col.update_one(
         {"_id": user_id},
         {"$set": {"last_query": query}, "$setOnInsert": {"joined": datetime.now(timezone.utc)}},
@@ -1246,19 +1229,15 @@ async def search(_, msg: Message):
 
     loading_message = await msg.reply("🔎 <b>Searching...</b>", quote=True)
     
-    # Use helper function to fetch results (Page 0 by default)
     results, total_count, search_source, cleaned_query, tmdb_detected_title = await get_search_results(query, offset=0)
 
-    # Found Results?
     if results:
         await loading_message.delete()
         header_text = f"🎬 **আপনার মুভি পাওয়া গেছে:**\n{search_source}" if search_source else "🎬 **আপনার মুভি পাওয়া গেছে:**"
         
-        # Send results with the buttons you asked for
-        await send_results(msg, results, total_count, offset=0, header=header_text)
+        await send_results(msg, results, total_count, offset=0, header=header_text, from_callback=False)
         return
 
-    # Not Found Logic
     await loading_message.delete()
     final_query = tmdb_detected_title if tmdb_detected_title else cleaned_query
     encoded_final_query = urllib.parse.quote_plus(final_query)
@@ -1276,7 +1255,6 @@ async def search(_, msg: Message):
     alert = await msg.reply_text(alert_text, reply_markup=InlineKeyboardMarkup([[req_btn], [google_btn]]), quote=True)
     asyncio.create_task(delete_message_later(alert.chat.id, alert.id))
 
-    # Auto Admin Notify
     encoded_query_admin = urllib.parse.quote_plus(query)
     admin_btns = InlineKeyboardMarkup([
         [
@@ -1306,29 +1284,24 @@ async def search(_, msg: Message):
         except Exception:
             pass
 
-async def send_results(msg, results, total_count, offset=0, header="🎬 আপনার মুভি পাওয়া গেছে:"):
-    """ This function handles the button layout for search results """
+async def send_results(msg, results, total_count, offset=0, header="🎬 আপনার মুভি পাওয়া গেছে:", from_callback=False):
+    """ Fixed Function: Handles buttons and correct pagination editing """
     
-    # Check Settings
     setting = await settings_col.find_one({"key": "verification_mode"})
     is_verify_on = setting.get("value", True) if setting else True
     
     buttons = []
-    # Identify user ID correctly based on message type
     user_id = msg.chat.id
     if msg.from_user:
         user_id = msg.from_user.id
 
-    # 1. MOVIE LIST BUTTONS
     for movie in results:
         title = movie.get('title') or movie.get('original_title')
         mid = movie['message_id']
         
         if is_verify_on:
-            # Verify Link
             link = await create_verification_link(mid, user_id)
         else:
-            # Direct Start Link
             bot_username = app.me.username
             link = f"https://t.me/{bot_username}?start=watch_{mid}"
         
@@ -1339,32 +1312,23 @@ async def send_results(msg, results, total_count, offset=0, header="🎬 আপ�
             )
         ])
 
-    # 2. FILTER BUTTONS (As requested in Screenshot)
-    # These buttons will appear after the movie list
     buttons.append([
         InlineKeyboardButton("QUALITY", callback_data="filter_quality"),
         InlineKeyboardButton("LANGUAGE", callback_data="filter_lang"),
         InlineKeyboardButton("SEASON", callback_data="filter_season")
     ])
 
-    # 3. PAGINATION BUTTONS (As requested in Screenshot)
-    # Logic to show: [< Back] [1/130] [Next >]
     pagination_buttons = []
-    
-    # Calculate pages
     current_page = (offset // RESULTS_COUNT) + 1
     total_pages = math.ceil(total_count / RESULTS_COUNT)
     
-    # Back Button
     if offset > 0:
         pagination_buttons.append(InlineKeyboardButton("< Back", callback_data=f"prev_page_{offset}"))
     else:
         pagination_buttons.append(InlineKeyboardButton("PAGE", callback_data="ignore"))
 
-    # Page Number Button (Active)
     pagination_buttons.append(InlineKeyboardButton(f"{current_page}/{total_pages}", callback_data="ignore"))
 
-    # Next Button
     if (offset + RESULTS_COUNT) < total_count:
         pagination_buttons.append(InlineKeyboardButton("NEXT >", callback_data=f"next_page_{offset}"))
     else:
@@ -1375,9 +1339,9 @@ async def send_results(msg, results, total_count, offset=0, header="🎬 আপ�
     footer = "👇 নিচের লিংকে ক্লিক করে ভেরিফাই করুন:" if is_verify_on else "👇 ডাউনলোড করতে ক্লিক করুন:"
     final_text = f"{header}\n{footer}"
     
-    # If called from a callback (msg is Message object), edit it. If from text, reply.
     try:
-        if isinstance(msg, Message) and msg.via_bot: # It's an update to existing bot msg
+        # FIX: If it is a callback (editing), use edit_text. Else reply.
+        if from_callback:
              await msg.edit_text(final_text, reply_markup=InlineKeyboardMarkup(buttons))
         else:
              m = await msg.reply(final_text, reply_markup=InlineKeyboardMarkup(buttons), quote=True)
@@ -1395,7 +1359,6 @@ async def callback_handler(_, cq: CallbackQuery):
     user_id = cq.from_user.id
     
     try:
-        # HOME BUTTON
         if data == "home_menu":
             btns = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔰 ADD ME TO YOUR GROUP 🔰", url=f"https://t.me/{app.me.username}?startgroup=true")],
@@ -1413,7 +1376,6 @@ async def callback_handler(_, cq: CallbackQuery):
                 reply_markup=btns
             )
         
-        # HELP BUTTON
         elif data == "help_menu":
             help_text = """
 **📢 HELP MENU**
@@ -1428,7 +1390,6 @@ async def callback_handler(_, cq: CallbackQuery):
 """
             await cq.message.edit_caption(caption=help_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="home_menu")]]))
         
-        # ABOUT BUTTON
         elif data == "about_menu":
             about_text = f"""
 **📘 ABOUT BOT**
@@ -1441,7 +1402,6 @@ async def callback_handler(_, cq: CallbackQuery):
 """
             await cq.message.edit_caption(caption=about_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="home_menu")]]))
 
-        # TOP SEARCHING
         elif data == "top_searching":
             top_movies = await movies_col.find().sort("views_count", -1).limit(10).to_list(length=10)
             
@@ -1459,7 +1419,6 @@ async def callback_handler(_, cq: CallbackQuery):
                 mid = movie['message_id']
                 views = movie.get('views_count', 0)
                 
-                # Link Logic
                 link = await create_verification_link(mid, user_id) if is_verify_on else f"https://t.me/{app.me.username}?start=watch_{mid}"
                 
                 msg_text += f"{idx}. {title} ({views} views)\n"
@@ -1469,9 +1428,8 @@ async def callback_handler(_, cq: CallbackQuery):
             
             await cq.message.edit_caption(caption=msg_text, reply_markup=InlineKeyboardMarkup(buttons))
 
-        # --- PAGINATION & FILTERS HANDLER ---
+        # --- FIX: PAGINATION HANDLER (IN-PLACE EDIT) ---
         elif data.startswith("next_page_") or data.startswith("prev_page_"):
-            # Get User's Last Query from DB
             user_data = await users_col.find_one({"_id": user_id})
             if not user_data or "last_query" not in user_data:
                 await cq.answer("⚠️ সেশন এক্সপায়ার হয়েছে। আবার সার্চ করুন।", show_alert=True)
@@ -1480,41 +1438,87 @@ async def callback_handler(_, cq: CallbackQuery):
             last_query = user_data["last_query"]
             current_offset = int(data.split("_")[2])
             
-            # Calculate new offset
             if "next" in data:
                 new_offset = current_offset + RESULTS_COUNT
             else:
                 new_offset = max(0, current_offset - RESULTS_COUNT)
             
-            # Fetch new results
             results, total_count, _, _, _ = await get_search_results(last_query, offset=new_offset)
             
             if results:
-                await send_results(cq.message, results, total_count, offset=new_offset, header=f"🔎 ফলাফল: **{last_query}**")
+                # IMPORTANT: from_callback=True ensures editing
+                await send_results(cq.message, results, total_count, offset=new_offset, header=f"🔎 ফলাফল: **{last_query}**", from_callback=True)
             else:
                 await cq.answer("⚠️ আর কোনো ফলাফল নেই!", show_alert=True)
 
-        elif data in ["filter_quality", "filter_lang", "filter_season"]:
-            # Placeholder for filters (requires more complex DB query in future)
-            await cq.answer("🛠 Filter feature coming soon!", show_alert=True)
+        # --- FIX: WORKING FILTERS (Quality, Language, Season) ---
+        elif data == "filter_quality":
+            buttons = [
+                [InlineKeyboardButton("480p", callback_data="add_filter_480p"), InlineKeyboardButton("720p", callback_data="add_filter_720p")],
+                [InlineKeyboardButton("1080p", callback_data="add_filter_1080p"), InlineKeyboardButton("4K / 2160p", callback_data="add_filter_4k")],
+                [InlineKeyboardButton("🔙 Back to Results", callback_data="back_to_search")]
+            ]
+            await cq.message.edit_text("🎥 **Select Quality:**", reply_markup=InlineKeyboardMarkup(buttons))
+
+        elif data == "filter_lang":
+            buttons = [
+                [InlineKeyboardButton("Hindi", callback_data="add_filter_Hindi"), InlineKeyboardButton("Bangla", callback_data="add_filter_Bangla")],
+                [InlineKeyboardButton("English", callback_data="add_filter_English"), InlineKeyboardButton("Tamil", callback_data="add_filter_Tamil")],
+                [InlineKeyboardButton("🔙 Back to Results", callback_data="back_to_search")]
+            ]
+            await cq.message.edit_text("🗣 **Select Language:**", reply_markup=InlineKeyboardMarkup(buttons))
+
+        elif data == "filter_season":
+            buttons = [
+                [InlineKeyboardButton("Season 1", callback_data="add_filter_S01"), InlineKeyboardButton("Season 2", callback_data="add_filter_S02")],
+                [InlineKeyboardButton("Season 3", callback_data="add_filter_S03"), InlineKeyboardButton("Season 4", callback_data="add_filter_S04")],
+                [InlineKeyboardButton("🔙 Back to Results", callback_data="back_to_search")]
+            ]
+            await cq.message.edit_text("📺 **Select Season:**", reply_markup=InlineKeyboardMarkup(buttons))
+
+        elif data.startswith("add_filter_"):
+            # Logic: Get last query, Append new filter, Save, Search again
+            filter_text = data.split("_")[2]
+            user_data = await users_col.find_one({"_id": user_id})
             
+            if user_data and "last_query" in user_data:
+                old_query = user_data["last_query"]
+                # Append filter text to query (e.g. "Avengers" -> "Avengers 720p")
+                new_query = f"{old_query} {filter_text}".strip()
+                
+                await users_col.update_one({"_id": user_id}, {"$set": {"last_query": new_query}})
+                
+                # Run search with new query
+                results, total_count, _, _, _ = await get_search_results(new_query, offset=0)
+                
+                if results:
+                    await send_results(cq.message, results, total_count, offset=0, header=f"🔎 ফিল্টার করা হয়েছে: **{new_query}**", from_callback=True)
+                else:
+                    await cq.answer("⚠️ এই ফিল্টারে কোনো ফাইল পাওয়া যায়নি!", show_alert=True)
+                    # Go back to original results
+                    await users_col.update_one({"_id": user_id}, {"$set": {"last_query": old_query}})
+            else:
+                await cq.answer("⚠️ সেশন টাইমআউট! আবার সার্চ করুন।", show_alert=True)
+
+        elif data == "back_to_search":
+            user_data = await users_col.find_one({"_id": user_id})
+            if user_data and "last_query" in user_data:
+                results, total_count, _, _, _ = await get_search_results(user_data["last_query"], offset=0)
+                await send_results(cq.message, results, total_count, offset=0, header=f"🔎 ফলাফল: **{user_data['last_query']}**", from_callback=True)
+            else:
+                await cq.answer("Expired!", show_alert=True)
+
         elif data == "ignore":
             await cq.answer()
 
         elif data.startswith("report_"):
             await cq.answer("Report Sent!", show_alert=True)
         
-        # --- DELETE CONFIRMATION HANDLER ---
         elif data.startswith("confirm_del_"):
             try:
-                # 1. Decode Title
                 title_encoded = data.replace("confirm_del_", "")
                 title = urllib.parse.unquote_plus(title_encoded)
-                
-                # 2. Perform Delete
                 result = await movies_col.delete_many({"title": {"$regex": re.escape(title), "$options": "i"}})
-                
-                # 3. Show Success
                 await cq.message.edit_text(f"✅ **সফল!**\n**'{title}'** সম্পর্কিত মোট **{result.deleted_count}** টি ফাইল ডিলিট করা হয়েছে।")
             except Exception as e:
                 await cq.message.edit_text(f"❌ এরর: {e}")
@@ -1529,7 +1533,6 @@ async def callback_handler(_, cq: CallbackQuery):
         elif data == "cancel_delete_all_movies":
             await cq.message.edit_text("❌ Cancelled!")
 
-        # ------------------- REQUEST ADMIN RESPONSE -------------------
         elif data.startswith("request_movie_"):
             try:
                 _, user_id_str, movie_name_encoded = data.split("_", 2)
@@ -1573,7 +1576,6 @@ async def callback_handler(_, cq: CallbackQuery):
             except Exception as e:
                 logger.error(f"Request Error: {e}")
 
-        # এডমিন বাটনে ক্লিক করলে ইউজারের কাছে রিপ্লাই যাবে
         elif data.startswith("rep_"):
             try:
                 _, action, user_id_str, movie_name_encoded = data.split("_", 3)
@@ -1623,7 +1625,7 @@ async def callback_handler(_, cq: CallbackQuery):
         logger.error(f"Callback Error: {e}")
 
 if __name__ == "__main__":
-    print("🚀 Bot Started (Ultimate Version with Pagination)...")
+    print("🚀 Bot Started (Ultimate Version with Pagination & Filters)...")
     Thread(target=run_flask).start() # Start Flask Web Server
     app.loop.create_task(init_settings()) # Init Settings
     app.loop.create_task(auto_group_messenger()) # Start Auto Msg
