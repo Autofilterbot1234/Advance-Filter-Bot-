@@ -2,7 +2,7 @@
 # ----------------------------------------------------
 # Developed by: Ctgmovies23
 # Project: TGLinkBase Auto Filter Bot (Ultimate Edition)
-# Version: 5.3 (Fixed KeyError: chat_id for Old Database)
+# Version: 5.5 (Added: Auto Channel Cache Refresh on Startup)
 # Features:
 #   - Auto Filter (MongoDB)
 #   - Multi-Channel Indexing (ID Batch Fetching)
@@ -13,6 +13,7 @@
 #   - Auto Broadcast & Group Messenger
 #   - Smart Search (TMDB + Spelling Correction)
 #   - Supports Direct Files & Poster Link Posts
+#   - Startup Cache Refresh (Fixes 'File Not Found' after Restart)
 # ----------------------------------------------------
 #
 
@@ -34,7 +35,7 @@ import aiohttp # For Async Web Requests (TMDB/API)
 from flask import Flask # For Web Verification Server
 
 # ------------------- PYROGRAM -------------------
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import (
     Message, 
     InlineKeyboardMarkup, 
@@ -447,7 +448,7 @@ def find_corrected_matches(query_clean, all_movie_titles_data, score_cutoff=80, 
     return sorted(corrected_suggestions, key=lambda x: x["score"], reverse=True)
 
 # ==============================================================================
-#                           CORE LOGIC: SAVING & BROADCAST
+#                           CORE LOGIC: SAVING, CACHING & BROADCAST
 # ==============================================================================
 
 async def process_movie_save(message):
@@ -499,6 +500,37 @@ async def process_movie_save(message):
         logger.error(f"Save Error: {e}")
     
     return None
+
+async def refresh_channel_cache():
+    """
+    CRITICAL: This function runs on startup to 'ping' all indexed channels.
+    This solves the 'PeerIdInvalid' or 'File Not Found' issue after restart.
+    """
+    print("🔄 Refreshing Channel Cache (Fixing 'File Not Found' issue)...")
+    try:
+        # Get all unique chat_ids from database
+        pipeline = [{"$group": {"_id": "$chat_id"}}]
+        # Depending on motor version, aggregate returns a cursor
+        cursor = movies_col.aggregate(pipeline)
+        
+        unique_channels = []
+        async for doc in cursor:
+            unique_channels.append(doc["_id"])
+        
+        count = 0
+        for chat_id in unique_channels:
+            try:
+                # Just getting the chat is enough to cache the peer
+                await app.get_chat(chat_id)
+                count += 1
+                await asyncio.sleep(0.5) # Slight delay to avoid floodwait
+            except Exception as e:
+                logger.warning(f"Failed to refresh cache for channel {chat_id}: {e}")
+                
+        print(f"✅ Successfully Refreshed {count} Channels!")
+        
+    except Exception as e:
+        logger.error(f"Channel Refresh Failed: {e}")
 
 async def auto_group_messenger():
     print("✅ Auto Group Messenger Service Started...")
@@ -1402,9 +1434,38 @@ async def callback_handler(_, cq: CallbackQuery):
     except Exception as e:
         logger.error(f"Callback Error: {e}")
 
+# ==============================================================================
+#                           MAIN EXECUTION (MODIFIED FOR STARTUP REFRESH)
+# ==============================================================================
+
 if __name__ == "__main__":
-    print("🚀 Bot Started (Ultimate Version with Key Fixes)...")
-    Thread(target=run_flask).start() # Start Flask Web Server
-    app.loop.create_task(init_settings()) # Init Settings
-    app.loop.create_task(auto_group_messenger()) # Start Auto Msg
-    app.run() # Start Bot
+    print("🚀 Bot Started (Version 5.5 with Startup Refresh)...")
+    
+    # Start Flask in a separate thread
+    Thread(target=run_flask).start()
+    
+    # Define Main Async Routine
+    async def main():
+        # Start the client
+        await app.start()
+        
+        # 1. Initialize Settings
+        await init_settings()
+        
+        # 2. Start Auto Messenger
+        asyncio.create_task(auto_group_messenger())
+        
+        # 3. CRITICAL: Refresh Channel Cache on Startup
+        # This fixes the "PeerIdInvalid" or "File Not Found" issue after restart
+        await refresh_channel_cache()
+        
+        print("✅ Bot is now fully operational!")
+        
+        # Keep the bot running
+        await idle()
+        
+        # Stop client when idle finishes
+        await app.stop()
+
+    # Run the client
+    app.run(main())
