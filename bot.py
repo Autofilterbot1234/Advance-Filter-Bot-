@@ -2,16 +2,17 @@
 # ----------------------------------------------------
 # Developed by: Ctgmovies23
 # Project: TGLinkBase Auto Filter Bot (Ultimate Edition)
-# Version: 5.0 (Final Production Ready)
+# Version: 5.1 (Fixed Indexing & Link Post Support)
 # Features:
 #   - Auto Filter (MongoDB)
-#   - Multi-Channel Indexing
+#   - Multi-Channel Indexing (ID Batch Fetching)
 #   - Safe Bulk Delete (Preview & Confirm)
 #   - Web Verification (Flask + Ads)
 #   - Content Protection (Forward Block)
 #   - Auto Admin Notification
 #   - Auto Broadcast & Group Messenger
 #   - Smart Search (TMDB + Spelling Correction)
+#   - Supports Direct Files & Poster Link Posts
 # ----------------------------------------------------
 #
 
@@ -527,38 +528,52 @@ def find_corrected_matches(query_clean, all_movie_titles_data, score_cutoff=80, 
 async def process_movie_save(message):
     """
     Parses a message and saves it to the database.
-    Returns the Title if saved, None otherwise.
+    Ensures 'Same to Same' copy by saving the ID and extracting the Title from the first line.
+    Works for both Direct Files and Link Posts (Photos with Captions).
     """
-    text = message.text or message.caption
-    if not text: return None
-    
-    # Validate Media
-    if not (message.document or message.video or message.audio):
+    # ১. টেক্সট বা ক্যাপশন অবশ্যই থাকতে হবে (টাইটেল ডিটেক্ট করার জন্য)
+    # যদি টেক্সট না থাকে, তাহলে সার্চ করা যাবে না, তাই রিটার্ন করছি।
+    text = message.caption or message.text
+    if not text: 
         return None
 
+    # ২. মিডিয়া ভ্যালিডেশন (ফটো, ভিডিও, ডকুমেন্ট, অডিও - যা ই হোক আমরা নিব)
+    if not (message.photo or message.video or message.document or message.audio):
+        return None
+
+    # ৩. টাইটেল প্রসেসিং (প্রথম লাইন টাইটেল হিসেবে ধরা হবে)
+    # যেমন: "The Skin Painter 2 (2018) Bengali Dubbed ORG" -> এটি টাইটেল হবে
+    movie_title = text.splitlines()[0].strip()
+    
+    # টাইটেল খুব ছোট হলে বা ভ্যালিড না হলে বাদ দেওয়া
+    if len(movie_title) < 2: 
+        return None
+    
+    # ৪. থাম্বনেইল আইডি বের করা (সার্চ রেজাল্টে দেখানোর জন্য)
     thumbnail_file_id = None
     if message.photo:
-        thumbnail_file_id = message.photo.file_id
+        thumbnail_file_id = message.photo.file_id 
     elif message.video and message.video.thumbs:
         thumbnail_file_id = message.video.thumbs[0].file_id 
+    elif message.document and message.document.thumbs:
+        thumbnail_file_id = message.document.thumbs[0].file_id
 
-    movie_title = text.splitlines()[0]
-    
+    # ৫. ডাটাবেসে সেভ করার জন্য ডাটা রেডি করা
     raw_data = {
-        "chat_id": message.chat.id, # IMPORTANT: Stores source channel ID
-        "message_id": message.id,
-        "title": movie_title, 
-        "full_caption": text, 
+        "chat_id": message.chat.id,    # সোর্স চ্যানেল আইডি
+        "message_id": message.id,      # সোর্স মেসেজ আইডি
+        "title": movie_title,          # অরিজিনাল টাইটেল (ডিসপ্লের জন্য)
+        "full_caption": text,          # পুরো ক্যাপশন
         "date": message.date,
-        "year": extract_year(text),
-        "language": extract_language(text),
-        "title_clean": clean_text(text), 
+        "year": extract_year(text),    # সাল বের করার চেষ্টা
+        "language": extract_language(text), # ভাষা বের করার চেষ্টা
+        "title_clean": clean_text(text), # ক্লিন টাইটেল (সার্চের জন্য)
         "views_count": 0,
         "thumbnail_id": thumbnail_file_id 
     }
 
     try:
-        # Avoid duplicates within the SAME channel
+        # ডুপ্লিকেট চেক (একই চ্যানেলে সেম মেসেজ যেন দুইবার সেভ না হয়)
         existing = await movies_col.find_one({"chat_id": message.chat.id, "message_id": message.id})
         if not existing:
             validated_data = movie_schema.load(raw_data)
@@ -722,12 +737,12 @@ async def log_group(_, msg: Message):
         upsert=True
     )
 
-# 3. MANUAL INDEXING COMMAND (For Multi-Channel) - FIXED VERSION
+# 3. MANUAL INDEXING COMMAND (For Multi-Channel) - FIXED & BATCH MODE
 @app.on_message(filters.command("index") & filters.user(ADMIN_IDS))
 async def index_channel_handler(_, msg: Message):
     target_chat_id = None
     
-    # Logic to get chat_id from reply or argument
+    # 1. চ্যাট আইডি বের করা
     if msg.reply_to_message and msg.reply_to_message.forward_from_chat:
         target_chat_id = msg.reply_to_message.forward_from_chat.id
     elif len(msg.command) > 1:
@@ -735,70 +750,98 @@ async def index_channel_handler(_, msg: Message):
         except: pass
 
     if not target_chat_id:
-        return await msg.reply("❌ **ভুল ব্যবহার!**\n\n১. যে চ্যানেল ইনডেক্স করতে চান, সেখান থেকে একটি মেসেজ **ফরোয়ার্ড** করে তার রিপ্লাইতে `/index` লিখুন।\n২. অথবা কমান্ডের পাশে চ্যানেল আইডি দিন: `/index -100xxxx`\n\n⚠️ **দ্রষ্টব্য:** বটকে অবশ্যই ওই চ্যানেলের **Admin** হতে হবে।")
+        return await msg.reply("❌ চ্যানেল আইডি পাওয়া যায়নি। সঠিক নিয়ম: `/index -100xxxx` অথবা চ্যানেল থেকে ফরোয়ার্ড করা মেসেজে রিপ্লাই দিন।")
 
-    # Check if Bot is Admin and get Last Message ID
+    # 2. লাস্ট মেসেজ আইডি বের করা
     try:
-        # We send a temporary message to detect the last message ID
         check_msg = await app.send_message(target_chat_id, "⚠️ **Indexing Logic initialized...**")
         last_msg_id = check_msg.id
         await check_msg.delete()
     except Exception as e:
         return await msg.reply(f"❌ **Error:** বট ওই চ্যানেলে মেসেজ পাঠাতে পারছে না। বটকে অবশ্যই **Admin** হতে হবে।\nError: {e}")
 
-    status_msg = await msg.reply(f"⏳ **Indexing started for:** `{target_chat_id}`\n🔍 Last ID: {last_msg_id}\nঅনুগ্রহ করে অপেক্ষা করুন...")
+    status_msg = await msg.reply(f"⏳ **Indexing Started...**\n🎯 Target: `{target_chat_id}`\n🔢 Last ID: `{last_msg_id}`\n🚀 Speed: `Safe Mode`")
     
     total_indexed = 0
     total_skipped = 0
+    already_exists = 0
+    
+    # ব্যাচ সাইজ (Safe Mode: 100 messages per request)
+    batch_size = 100
     
     try:
-        # Loop backwards from last ID to 1 in batches of 200
-        # This bypasses the 'BOT_METHOD_INVALID' error
-        for i in range(last_msg_id, 0, -200):
+        for i in range(last_msg_id, 0, -batch_size):
             try:
-                # Calculate batch range
+                # আইডি রেঞ্জ তৈরি
                 start_id = i
-                end_id = max(1, i - 199)
+                end_id = max(1, i - batch_size + 1)
                 ids = list(range(start_id, end_id - 1, -1))
                 
-                # Fetch 200 messages at once
-                messages = await app.get_messages(target_chat_id, ids)
-                
+                # মেসেজ ফেচ করা (FloodWait হ্যান্ডলিং সহ)
+                try:
+                    messages = await app.get_messages(target_chat_id, ids)
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 2) # ওয়েট করে আবার চেষ্টা
+                    messages = await app.get_messages(target_chat_id, ids)
+                except Exception as e:
+                    logger.error(f"Fetch Error: {e}")
+                    continue
+
+                if not messages:
+                    continue
+
+                # মেসেজ প্রসেসিং
                 for message in messages:
-                    # Skip empty/deleted messages
+                    # মেসেজ যদি এম্পটি হয় বা ডিলিটেড হয়
                     if not message or message.empty:
                         continue
                         
                     try:
-                        saved = await process_movie_save(message)
-                        if saved: 
+                        # আগে চেক করি ডাটাবেসে আছে কিনা
+                        exists = await movies_col.find_one({"chat_id": target_chat_id, "message_id": message.id})
+                        if exists:
+                            already_exists += 1
+                            continue
+
+                        # সেভ করার চেষ্টা
+                        saved_title = await process_movie_save(message)
+                        if saved_title: 
                             total_indexed += 1
                         else:
-                            total_skipped += 1
-                    except Exception:
-                        pass
+                            total_skipped += 1 # মিডিয়া নেই বা টেক্সট মেসেজ
+                    except Exception as inner_e:
+                        logger.error(f"Save Error: {inner_e}")
                 
-                # Update status every 200 messages
+                # প্রতি ব্যাচে ১.৫ সেকেন্ড বিরতি (যাতে FloodWait না আসে)
+                await asyncio.sleep(1.5)
+                
+                # স্ট্যাটাস আপডেট (প্রতি ২০০ মেসেজ পর পর)
                 if i % 200 == 0:
                     try: 
                         await status_msg.edit_text(
                             f"⏳ **Indexing Running...**\n"
-                            f"📡 Processing IDs: {start_id} - {end_id}\n"
+                            f"📡 Scanning IDs: {start_id} ➝ {end_id}\n"
                             f"✅ Saved: {total_indexed}\n"
-                            f"⏭ Skipped: {total_skipped}"
+                            f"♻️ Already Exists: {already_exists}\n"
+                            f"⏭ Skipped (No Media): {total_skipped}"
                         )
                     except: pass
                     
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
             except Exception as e:
-                logger.error(f"Batch Error: {e}")
+                logger.error(f"Batch Loop Error: {e}")
                 pass
 
     except Exception as e:
         return await status_msg.edit_text(f"❌ **Critical Error:** {e}")
 
-    await status_msg.edit_text(f"✅ **Indexing Completed!**\n📂 চ্যানেল: `{target_chat_id}`\n💾 মোট ফাইল সেভ করা হয়েছে: **{total_indexed}** টি।")
+    await status_msg.edit_text(
+        f"✅ **Indexing Completed!**\n"
+        f"📂 চ্যানেল: `{target_chat_id}`\n"
+        f"💾 নতুন সেভ হয়েছে: **{total_indexed}** টি\n"
+        f"♻️ আগে থেকেই ছিল: **{already_exists}** টি\n"
+        f"🗑 বাদ দেওয়া হয়েছে: **{total_skipped}** টি"
+    )
+
 # 4. START COMMAND (Logic Hub)
 user_last_start_time = {}
 
