@@ -2,7 +2,7 @@
 # ----------------------------------------------------
 # Developed by: Ctgmovies23
 # Project: TGLinkBase Auto Filter Bot (Ultimate Edition)
-# Version: 6.0 (Fixed Pagination + Working Filters)
+# Version: 6.1 (Fixed Pagination + Filters + Robust Broadcast)
 # Features:
 #   - Auto Filter (MongoDB)
 #   - Multi-Channel Indexing (ID Batch Fetching)
@@ -15,6 +15,7 @@
 #   - Supports Direct Files & Poster Link Posts
 #   - UI: Working Quality, Language, Season Filters
 #   - UI: Smooth Page Navigation (In-Place Edit)
+#   - FIXED: Robust Manual Broadcast System
 # ----------------------------------------------------
 #
 
@@ -691,7 +692,7 @@ async def auto_group_messenger():
         await asyncio.sleep(AUTO_MSG_INTERVAL)
 
 async def broadcast_messages(cursor, message_func, status_msg=None, total_users=0):
-    """ Robust Broadcast Function with Progress Bar """
+    """ Robust Broadcast Function with Progress Bar (Used for Auto-Notification) """
     success = 0
     failed = 0
     start_time = time.time()
@@ -1065,37 +1066,81 @@ async def toggle_verification(_, msg: Message):
     await settings_col.update_one({"key": "verification_mode"}, {"$set": {"value": new_status}}, upsert=True)
     await msg.reply(f"🌍 **ভেরিফিকেশন মোড {'চালু' if new_status else 'বন্ধ'} করা হয়েছে!**")
 
-# Manual Broadcast
-@app.on_message(filters.command("broadcast") & filters.user(ADMIN_IDS))
-async def broadcast(_, msg: Message):
-    if not msg.reply_to_message and len(msg.command) < 2:
-        await msg.reply("ব্যবহার:\n১. কোনো মেসেজে রিপ্লাই দিয়ে `/broadcast` লিখুন।")
-        return
-    
-    reply_msg = msg.reply_to_message
-    broadcast_text = None
-    origin_chat_id = None
-    origin_message_id = None
-    
-    if reply_msg:
-        origin_chat_id = reply_msg.chat.id
-        origin_message_id = reply_msg.id
-    else:
-        full_text = msg.text or msg.caption
-        if not full_text: return
-        broadcast_text = full_text.split(None, 1)[1]
+# ==============================================================================
+#                           UPDATED BROADCAST HANDLER
+# ==============================================================================
+# এই অংশটি আপনার চাহিদা অনুযায়ী আপডেট করা হয়েছে।
+# এটি কোনো মেসেজে রিপ্লাই দিয়ে /broadcast কমান্ড দিলে কাজ করবে।
 
+@app.on_message(filters.command("broadcast") & filters.user(ADMIN_IDS) & filters.reply)
+async def broadcast_handler(bot, m):
+    # শুরুর সময় এবং স্ট্যাটাস মেসেজ
+    start_time = time.time()
+    status_msg = await m.reply_text("📢 **ব্রডকাস্ট শুরু হচ্ছে...**\nদয়া করে অপেক্ষা করুন।", quote=True)
+    
+    # যে মেসেজটি পাঠাতে হবে
+    broadcast_msg = m.reply_to_message
+    
+    # ডাটাবেস থেকে সব ইউজার নেওয়া
     total_users = await users_col.count_documents({})
-    status_msg = await msg.reply_photo(photo=BROADCAST_PIC, caption=f"🚀 **ম্যানুয়াল ব্রডকাস্ট শুরু...**\n👥 টার্গেট: `{total_users}`")
-    cursor = users_col.find({}, {"_id": 1})
+    all_users = users_col.find({})
+    
+    done = 0
+    blocked = 0
+    deleted = 0
+    failed = 0
+    
+    async for user in all_users:
+        user_id = user.get("_id")
+        
+        try:
+            # মেসেজটি কপি করে পাঠানো (Forward Tag ছাড়া)
+            await broadcast_msg.copy(chat_id=user_id)
+            done += 1
+            
+        except FloodWait as e:
+            # টেলিগ্রাম লিমিট দিলে অপেক্ষা করবে
+            await asyncio.sleep(e.value)
+            try:
+                await broadcast_msg.copy(chat_id=user_id)
+                done += 1
+            except Exception:
+                failed += 1
+                
+        except UserIsBlocked:
+            # ইউজার যদি বট ব্লক করে রাখে
+            blocked += 1
+            
+        except InputUserDeactivated:
+            # ইউজার যদি একাউন্ট ডিলিট করে দেয়
+            deleted += 1
+            await users_col.delete_one({"_id": user_id})
+            
+        except Exception:
+            failed += 1
+            
+        # প্রতি ২০ জন পর পর স্ট্যাটাস আপডেট করবে
+        if done % 20 == 0:
+            await status_msg.edit_text(
+                f"📢 **ব্রডকাস্ট চলছে...**\n\n"
+                f"✅ সফল: `{done}`\n"
+                f"❌ ব্লকড: `{blocked}`\n"
+                f"🗑 ডিলিটেড: `{deleted}`\n"
+                f"⚠️ ফেইলড: `{failed}`\n"
+                f"👥 মোট ইউজার: `{total_users}`"
+            )
 
-    async def send_func(user_id):
-        if reply_msg:
-            await app.copy_message(user_id, origin_chat_id, origin_message_id)
-        else:
-            await app.send_message(user_id, broadcast_text, disable_web_page_preview=True)
-
-    asyncio.create_task(broadcast_messages(cursor, send_func, status_msg, total_users))
+    time_taken = datetime.timedelta(seconds=int(time.time() - start_time))
+    
+    # শেষ হলে ফাইনাল রিপোর্ট
+    await status_msg.edit_text(
+        f"✅ **ব্রডকাস্ট সম্পন্ন হয়েছে!**\n\n"
+        f"✅ সফলভাবে পাঠানো হয়েছে: `{done}` জন\n"
+        f"❌ ইউজার ব্লক করেছে: `{blocked}` জন\n"
+        f"🗑 ডিলিটেড একাউন্ট: `{deleted}` জন\n"
+        f"⚠️ ফেইলড: `{failed}` জন\n\n"
+        f"⏳ সময় লেগেছে: `{time_taken}`"
+    )
 
 # Stats Command
 @app.on_message(filters.command("stats") & filters.user(ADMIN_IDS))
@@ -1462,7 +1507,7 @@ async def callback_handler(_, cq: CallbackQuery):
 
         elif data == "filter_lang":
             buttons = [
-                [InlineKeyboardButton("Hindi", callback_data="add_filter_Hindi"), InlineKeyboardButton("Bangla", callback_data="add_filter_Bangla")],
+                [InlineKeyboardButton("Hindi", callback_data="add_filter_Hindi"), InlineKeyboardButton("Bengali", callback_data="add_filter_Bengali")],
                 [InlineKeyboardButton("English", callback_data="add_filter_English"), InlineKeyboardButton("Tamil", callback_data="add_filter_Tamil")],
                 [InlineKeyboardButton("🔙 Back to Results", callback_data="back_to_search")]
             ]
