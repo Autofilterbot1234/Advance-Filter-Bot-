@@ -722,7 +722,7 @@ async def log_group(_, msg: Message):
         upsert=True
     )
 
-# 3. MANUAL INDEXING COMMAND (For Multi-Channel)
+# 3. MANUAL INDEXING COMMAND (For Multi-Channel) - FIXED VERSION
 @app.on_message(filters.command("index") & filters.user(ADMIN_IDS))
 async def index_channel_handler(_, msg: Message):
     target_chat_id = None
@@ -737,25 +737,68 @@ async def index_channel_handler(_, msg: Message):
     if not target_chat_id:
         return await msg.reply("❌ **ভুল ব্যবহার!**\n\n১. যে চ্যানেল ইনডেক্স করতে চান, সেখান থেকে একটি মেসেজ **ফরোয়ার্ড** করে তার রিপ্লাইতে `/index` লিখুন।\n২. অথবা কমান্ডের পাশে চ্যানেল আইডি দিন: `/index -100xxxx`\n\n⚠️ **দ্রষ্টব্য:** বটকে অবশ্যই ওই চ্যানেলের **Admin** হতে হবে।")
 
-    status_msg = await msg.reply(f"⏳ **Indexing started for:** `{target_chat_id}`\nঅনুগ্রহ করে অপেক্ষা করুন...")
+    # Check if Bot is Admin and get Last Message ID
+    try:
+        # We send a temporary message to detect the last message ID
+        check_msg = await app.send_message(target_chat_id, "⚠️ **Indexing Logic initialized...**")
+        last_msg_id = check_msg.id
+        await check_msg.delete()
+    except Exception as e:
+        return await msg.reply(f"❌ **Error:** বট ওই চ্যানেলে মেসেজ পাঠাতে পারছে না। বটকে অবশ্যই **Admin** হতে হবে।\nError: {e}")
+
+    status_msg = await msg.reply(f"⏳ **Indexing started for:** `{target_chat_id}`\n🔍 Last ID: {last_msg_id}\nঅনুগ্রহ করে অপেক্ষা করুন...")
     
     total_indexed = 0
+    total_skipped = 0
+    
     try:
-        async for message in app.get_chat_history(target_chat_id):
-            saved = await process_movie_save(message)
-            if saved: total_indexed += 1
-            
-            if total_indexed % 100 == 0:
-                try: await status_msg.edit_text(f"⏳ **Indexing...**\nTotal Saved: {total_indexed}")
-                except: pass
+        # Loop backwards from last ID to 1 in batches of 200
+        # This bypasses the 'BOT_METHOD_INVALID' error
+        for i in range(last_msg_id, 0, -200):
+            try:
+                # Calculate batch range
+                start_id = i
+                end_id = max(1, i - 199)
+                ids = list(range(start_id, end_id - 1, -1))
                 
-    except ChannelInvalid:
-        return await status_msg.edit_text("❌ **Error:** চ্যানেল পাওয়া যাচ্ছে না অথবা বট সেখানে এডমিন নয়।")
+                # Fetch 200 messages at once
+                messages = await app.get_messages(target_chat_id, ids)
+                
+                for message in messages:
+                    # Skip empty/deleted messages
+                    if not message or message.empty:
+                        continue
+                        
+                    try:
+                        saved = await process_movie_save(message)
+                        if saved: 
+                            total_indexed += 1
+                        else:
+                            total_skipped += 1
+                    except Exception:
+                        pass
+                
+                # Update status every 200 messages
+                if i % 200 == 0:
+                    try: 
+                        await status_msg.edit_text(
+                            f"⏳ **Indexing Running...**\n"
+                            f"📡 Processing IDs: {start_id} - {end_id}\n"
+                            f"✅ Saved: {total_indexed}\n"
+                            f"⏭ Skipped: {total_skipped}"
+                        )
+                    except: pass
+                    
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception as e:
+                logger.error(f"Batch Error: {e}")
+                pass
+
     except Exception as e:
-        return await status_msg.edit_text(f"❌ **Error:** {e}")
+        return await status_msg.edit_text(f"❌ **Critical Error:** {e}")
 
-    await status_msg.edit_text(f"✅ **Indexing Completed!**\nমোট ফাইল সেভ করা হয়েছে: **{total_indexed}** টি।")
-
+    await status_msg.edit_text(f"✅ **Indexing Completed!**\n📂 চ্যানেল: `{target_chat_id}`\n💾 মোট ফাইল সেভ করা হয়েছে: **{total_indexed}** টি।")
 # 4. START COMMAND (Logic Hub)
 user_last_start_time = {}
 
