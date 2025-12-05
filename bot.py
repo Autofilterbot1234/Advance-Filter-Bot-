@@ -2,7 +2,7 @@
 # ----------------------------------------------------
 # Developed by: Ctgmovies23
 # Project: TGLinkBase Auto Filter Bot (Ultimate Edition)
-# Version: 5.6 (Fix: PeerIdInvalid & Auto Channel Refresh)
+# Version: 5.7 (Update: All Message Types Indexing Support)
 # Features:
 #   - Auto Filter (MongoDB)
 #   - Multi-Channel Indexing (ID Batch Fetching)
@@ -12,7 +12,7 @@
 #   - Auto Admin Notification
 #   - Auto Broadcast & Group Messenger
 #   - Smart Search (TMDB + Spelling Correction)
-#   - Supports Direct Files & Poster Link Posts
+#   - Supports Direct Files, Poster Links & Text Links
 #   - Startup Cache Refresh (Fixes 'File Not Found' after Restart)
 #   - Auto Retry Logic for Forwarding
 # ----------------------------------------------------
@@ -455,19 +455,21 @@ def find_corrected_matches(query_clean, all_movie_titles_data, score_cutoff=80, 
 async def process_movie_save(message):
     """
     Parses a message and saves it to the database.
+    UPDATED: Now supports Text Messages (Links), Videos, Documents, and Photos.
     """
+    # 1. Check if there is text/caption
     text = message.caption or message.text
     if not text: 
         return None
 
-    if not (message.photo or message.video or message.document or message.audio):
-        return None
-
+    # 2. Extract title from first line
     movie_title = text.splitlines()[0].strip()
     
+    # Ignore very short texts
     if len(movie_title) < 2: 
         return None
     
+    # 3. Handle Thumbnails (if media exists)
     thumbnail_file_id = None
     if message.photo:
         thumbnail_file_id = message.photo.file_id 
@@ -475,7 +477,9 @@ async def process_movie_save(message):
         thumbnail_file_id = message.video.thumbs[0].file_id 
     elif message.document and message.document.thumbs:
         thumbnail_file_id = message.document.thumbs[0].file_id
+    # Note: thumbnail_file_id will be None for Text/Link posts. This is intended.
 
+    # 4. Prepare data
     raw_data = {
         "chat_id": message.chat.id,    
         "message_id": message.id,      
@@ -489,11 +493,13 @@ async def process_movie_save(message):
         "thumbnail_id": thumbnail_file_id 
     }
 
+    # 5. Save to DB
     try:
         existing = await movies_col.find_one({"chat_id": message.chat.id, "message_id": message.id})
         if not existing:
             validated_data = movie_schema.load(raw_data)
             await movies_col.insert_one(validated_data)
+            print(f"✅ Indexed: {movie_title} (Type: {'Media' if thumbnail_file_id else 'Text/Link'})")
             return movie_title
     except ValidationError as err:
         logger.error(f"Validation Error: {err.messages}")
@@ -772,7 +778,7 @@ async def index_channel_handler(_, msg: Message):
                             f"📡 Scanning IDs: {start_id} ➝ {end_id}\n"
                             f"✅ Saved: {total_indexed}\n"
                             f"♻️ Already Exists: {already_exists}\n"
-                            f"⏭ Skipped (No Media): {total_skipped}"
+                            f"⏭ Skipped (No Text/Media): {total_skipped}"
                         )
                     except: pass
                     
@@ -1492,7 +1498,7 @@ async def callback_handler(_, cq: CallbackQuery):
 # ==============================================================================
 
 if __name__ == "__main__":
-    print("🚀 Bot Started (Version 5.6 with Auto Retry & Refresh)...")
+    print("🚀 Bot Started (Version 5.7 with Auto Retry & Refresh)...")
     
     # Start Flask in a separate thread
     Thread(target=run_flask).start()
