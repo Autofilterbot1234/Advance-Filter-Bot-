@@ -1,7 +1,7 @@
 #
 # ----------------------------------------------------
 # Developed by: Ctgmovies23
-# Final Version: All Features + Bulk Delete + Protect + Smart Notify
+# Final Version: All Features + Safe Bulk Delete (Preview System)
 # Status: 100% COMPLETE & READY TO RUN
 # ----------------------------------------------------
 #
@@ -834,7 +834,7 @@ async def notify_command(_, msg: Message):
     status = "চালু" if new_value else "বন্ধ"
     await msg.reply(f"✅ গ্লোবাল নোটিফিকেশন {status} করা হয়েছে!")
 
-# ------------------- UPDATED: Bulk Delete Feature -------------------
+# ------------------- SAFE: Bulk Delete Feature (With Preview) -------------------
 @app.on_message(filters.command("delete_movie") & filters.user(ADMIN_IDS))
 async def delete_specific_movie(_, msg: Message):
     if len(msg.command) < 2:
@@ -842,13 +842,31 @@ async def delete_specific_movie(_, msg: Message):
         return
     title = msg.text.split(None, 1)[1].strip()
     
-    # Using delete_many to delete ALL matches at once
-    result = await movies_col.delete_many({"title": {"$regex": re.escape(title), "$options": "i"}})
+    # 1. Search first, Don't delete
+    matches = await movies_col.find({"title": {"$regex": re.escape(title), "$options": "i"}}).to_list(length=100)
     
-    if result.deleted_count > 0:
-        await msg.reply(f"✅ **'{title}'** নামের সাথে মিল থাকা মোট **{result.deleted_count}** টি ফাইল ডিলিট করা হয়েছে!")
-    else:
+    if not matches:
         await msg.reply(f"❌ **'{title}'** নামে কোনো ফাইল পাওয়া যায়নি।")
+        return
+
+    # 2. Show Preview
+    text = f"⚠️ **সতর্কতা! আপনি নিচের ফাইলগুলো ডিলিট করতে যাচ্ছেন:**\n\n"
+    for idx, movie in enumerate(matches[:15], 1): # Max 15 show korbe
+        text += f"{idx}. {movie['title']}\n"
+    
+    if len(matches) > 15:
+        text += f"\n... এবং আরও {len(matches) - 15} টি ফাইল।"
+        
+    text += f"\n\n🔥 **মোট ফাইল:** {len(matches)} টি\nআপনি কি নিশ্চিত যে আপনি এগুলো সব ডিলিট করতে চান?"
+    
+    # 3. Create Buttons
+    encoded_title = urllib.parse.quote_plus(title)
+    btn = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ হ্যাঁ, সব ডিলিট করুন", callback_data=f"confirm_del_{encoded_title}")],
+        [InlineKeyboardButton("❌ না, বাতিল করুন", callback_data="cancel_del")]
+    ])
+    
+    await msg.reply(text, reply_markup=btn)
 
 @app.on_message(filters.command("delete_all_movies") & filters.user(ADMIN_IDS))
 async def delete_all_movies_command(_, msg: Message):
@@ -1129,6 +1147,24 @@ async def callback_handler(_, cq: CallbackQuery):
 
         elif data.startswith("report_"):
             await cq.answer("Report Sent!", show_alert=True)
+        
+        # --- NEW: Handle Delete Confirmation ---
+        elif data.startswith("confirm_del_"):
+            try:
+                # 1. Decode Title
+                title_encoded = data.replace("confirm_del_", "")
+                title = urllib.parse.unquote_plus(title_encoded)
+                
+                # 2. Perform Delete
+                result = await movies_col.delete_many({"title": {"$regex": re.escape(title), "$options": "i"}})
+                
+                # 3. Show Success
+                await cq.message.edit_text(f"✅ **সফল!**\n**'{title}'** সম্পর্কিত মোট **{result.deleted_count}** টি ফাইল ডিলিট করা হয়েছে।")
+            except Exception as e:
+                await cq.message.edit_text(f"❌ এরর: {e}")
+
+        elif data == "cancel_del":
+            await cq.message.edit_text("❌ ডিলিট বাতিল করা হয়েছে।")
             
         elif data == "confirm_delete_all_movies":
             await movies_col.delete_many({})
@@ -1231,7 +1267,7 @@ async def callback_handler(_, cq: CallbackQuery):
         logger.error(f"Callback Error: {e}")
 
 if __name__ == "__main__":
-    print("🚀 Bot Started with Bulk Delete, Protect & Smart Notify...")
+    print("🚀 Bot Started with SAFE Bulk Delete, Protect & Smart Notify...")
     app.loop.create_task(init_settings())
     app.loop.create_task(auto_group_messenger())
     app.run()
