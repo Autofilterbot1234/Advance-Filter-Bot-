@@ -1,7 +1,7 @@
 #
 # ----------------------------------------------------
 # Developed by: Ctgmovies23
-# Final Version: Auto Filter + Web Verify + Ads + Auto Notify + Protect Content
+# Final Version: All Features + Bulk Delete + Protect + Smart Notify
 # Status: 100% COMPLETE & READY TO RUN
 # ----------------------------------------------------
 #
@@ -535,7 +535,6 @@ async def broadcast_messages(cursor, message_func, status_msg=None, total_users=
         except: pass
 
 async def auto_broadcast_worker(movie_title, message_id, thumbnail_id=None):
-    # ডায়নামিক লিংক: যখন ইউজার ক্লিক করবে, তখন 'start' ফাংশন চেক করবে ভেরিফিকেশন অন নাকি অফ
     download_link = f"https://t.me/{app.me.username}?start=watch_{message_id}"
     
     download_button = InlineKeyboardMarkup([
@@ -738,7 +737,7 @@ WEB VERIFICATION SYSTEM.
 
 # ------------------- অ্যাডমিন কমান্ড -------------------
 
-# 1. Protect Content On/Off (New)
+# 1. Protect Content On/Off
 @app.on_message(filters.command("protect") & filters.user(ADMIN_IDS))
 async def toggle_protection(_, msg: Message):
     if len(msg.command) != 2 or msg.command[1] not in ["on", "off"]:
@@ -835,19 +834,21 @@ async def notify_command(_, msg: Message):
     status = "চালু" if new_value else "বন্ধ"
     await msg.reply(f"✅ গ্লোবাল নোটিফিকেশন {status} করা হয়েছে!")
 
+# ------------------- UPDATED: Bulk Delete Feature -------------------
 @app.on_message(filters.command("delete_movie") & filters.user(ADMIN_IDS))
 async def delete_specific_movie(_, msg: Message):
     if len(msg.command) < 2:
         await msg.reply("টাইটেল দিন। ব্যবহার: `/delete_movie <নাম>`")
         return
     title = msg.text.split(None, 1)[1].strip()
-    movie = await movies_col.find_one({"title": {"$regex": re.escape(title), "$options": "i"}})
     
-    if movie:
-        await movies_col.delete_one({"_id": movie["_id"]})
-        await msg.reply(f"মুভি **{movie['title']}** ডিলিট করা হয়েছে।")
+    # Using delete_many to delete ALL matches at once
+    result = await movies_col.delete_many({"title": {"$regex": re.escape(title), "$options": "i"}})
+    
+    if result.deleted_count > 0:
+        await msg.reply(f"✅ **'{title}'** নামের সাথে মিল থাকা মোট **{result.deleted_count}** টি ফাইল ডিলিট করা হয়েছে!")
     else:
-        await msg.reply(f"**{title}** পাওয়া যায়নি।")
+        await msg.reply(f"❌ **'{title}'** নামে কোনো ফাইল পাওয়া যায়নি।")
 
 @app.on_message(filters.command("delete_all_movies") & filters.user(ADMIN_IDS))
 async def delete_all_movies_command(_, msg: Message):
@@ -887,7 +888,7 @@ async def request_movie(_, msg: Message):
             await app.send_message(admin_id, f"❗ *নতুন অনুরোধ!*\n🎬 `{movie_name}`\n👤 [{username}](tg://user?id={user_id})", reply_markup=admin_btns)
         except: pass
 
-# ------------------- স্মার্ট সার্চ হ্যান্ডলার (With Toggle Logic) -------------------
+# ------------------- স্মার্ট সার্চ হ্যান্ডলার -------------------
 
 @app.on_message(filters.text & ~filters.command(["start", "verify", "broadcast", "stats", "feedback", "request", "notify", "delete_movie", "delete_all_movies", "protect"]) & (filters.group | filters.private))
 async def search(_, msg: Message):
@@ -963,7 +964,6 @@ async def search(_, msg: Message):
         await send_results(msg, results, header_text)
         return
 
-    # কিছু না পেলে -> ১. ইউজারকে বাটন দেখানো ২. এডমিনকে অটো মেসেজ পাঠানো
     await loading_message.delete()
     final_query = tmdb_detected_title if tmdb_detected_title else cleaned_query
     encoded_final_query = urllib.parse.quote_plus(final_query)
@@ -1231,7 +1231,7 @@ async def callback_handler(_, cq: CallbackQuery):
         logger.error(f"Callback Error: {e}")
 
 if __name__ == "__main__":
-    print("🚀 Bot Started with Protect, Verify & Smart Notify...")
+    print("🚀 Bot Started with Bulk Delete, Protect & Smart Notify...")
     app.loop.create_task(init_settings())
     app.loop.create_task(auto_group_messenger())
     app.run()
