@@ -1,20 +1,8 @@
 #
 # ----------------------------------------------------
 # Developed by: Ctgmovies23
-# Project: TGLinkBase Auto Filter Bot (Ultimate Edition)
-# Version: 5.7 (Update: All Message Types Indexing Support)
-# Features:
-#   - Auto Filter (MongoDB)
-#   - Multi-Channel Indexing (ID Batch Fetching)
-#   - Safe Bulk Delete (Preview & Confirm)
-#   - Web Verification (Flask + Ads + Dynamic Steps)
-#   - Content Protection (Forward Block)
-#   - Auto Admin Notification
-#   - Auto Broadcast & Group Messenger
-#   - Smart Search (TMDB + Spelling Correction)
-#   - Supports Direct Files, Poster Links & Text Links
-#   - Startup Cache Refresh (Fixes 'File Not Found' after Restart)
-#   - Auto Retry Logic for Forwarding
+# Project: TGLinkBase Auto Filter Bot (Final Ultimate Edition)
+# Version: 6.0 (Updated: Filename Support + Edit Support + Main Channel Focus)
 # ----------------------------------------------------
 #
 
@@ -455,21 +443,32 @@ def find_corrected_matches(query_clean, all_movie_titles_data, score_cutoff=80, 
 async def process_movie_save(message):
     """
     Parses a message and saves it to the database.
-    UPDATED: Now supports Text Messages (Links), Videos, Documents, and Photos.
+    UPDATED: Supports Media Filenames if Caption is missing.
     """
-    # 1. Check if there is text/caption
+    # 1. Check for Caption or Text
     text = message.caption or message.text
+
+    # 2. [FIX] If no caption, try to extract Filename from Media
+    if not text:
+        if message.document:
+            text = message.document.file_name
+        elif message.video:
+            text = message.video.file_name
+        elif message.audio:
+            text = message.audio.file_name
+            
+    # 3. If still no text found (e.g., Sticker or unnamed media), skip
     if not text: 
         return None
 
-    # 2. Extract title from first line
+    # 4. Extract title from first line
     movie_title = text.splitlines()[0].strip()
     
     # Ignore very short texts
     if len(movie_title) < 2: 
         return None
     
-    # 3. Handle Thumbnails (if media exists)
+    # 5. Handle Thumbnails (if media exists)
     thumbnail_file_id = None
     if message.photo:
         thumbnail_file_id = message.photo.file_id 
@@ -477,9 +476,8 @@ async def process_movie_save(message):
         thumbnail_file_id = message.video.thumbs[0].file_id 
     elif message.document and message.document.thumbs:
         thumbnail_file_id = message.document.thumbs[0].file_id
-    # Note: thumbnail_file_id will be None for Text/Link posts. This is intended.
 
-    # 4. Prepare data
+    # 6. Prepare data
     raw_data = {
         "chat_id": message.chat.id,    
         "message_id": message.id,      
@@ -493,14 +491,18 @@ async def process_movie_save(message):
         "thumbnail_id": thumbnail_file_id 
     }
 
-    # 5. Save to DB
+    # 7. Save to DB
     try:
-        existing = await movies_col.find_one({"chat_id": message.chat.id, "message_id": message.id})
-        if not existing:
-            validated_data = movie_schema.load(raw_data)
-            await movies_col.insert_one(validated_data)
-            print(f"✅ Indexed: {movie_title} (Type: {'Media' if thumbnail_file_id else 'Text/Link'})")
-            return movie_title
+        # Check if exists (for editing logic, we update; for new, we insert)
+        # However, insert_one will fail if duplicate unless we use update_one with upsert
+        # But here we stick to basic logic. If found, we update.
+        await movies_col.update_one(
+            {"chat_id": message.chat.id, "message_id": message.id},
+            {"$set": raw_data},
+            upsert=True
+        )
+        print(f"✅ Indexed/Updated: {movie_title}")
+        return movie_title
     except ValidationError as err:
         logger.error(f"Validation Error: {err.messages}")
     except Exception as e:
@@ -510,46 +512,16 @@ async def process_movie_save(message):
 
 async def refresh_channel_cache():
     """
-    CRITICAL: This function runs on startup to 'ping' all indexed channels.
-    This solves the 'PeerIdInvalid' or 'File Not Found' issue after restart.
+    Refreshes the MAIN Channel Cache on startup.
     """
-    print("🔄 Refreshing Channel Cache (Fixing 'File Not Found' issue)...")
+    print("🔄 Refreshing Main Channel Cache...")
     try:
-        # 1. Force Refresh Main Channel First
         if CHANNEL_ID:
             try:
                 await app.get_chat(CHANNEL_ID)
                 print(f"✅ Main Channel ({CHANNEL_ID}) Refreshed!")
             except Exception as e:
                 logger.warning(f"⚠️ Main Channel Refresh Failed: {e}")
-
-        # 2. Refresh Other Indexed Channels
-        pipeline = [{"$group": {"_id": "$chat_id"}}]
-        cursor = movies_col.aggregate(pipeline)
-        
-        unique_channels = []
-        async for doc in cursor:
-            chat_id = doc["_id"]
-            if chat_id != CHANNEL_ID: # Avoid double checking main channel
-                unique_channels.append(chat_id)
-        
-        count = 0
-        for chat_id in unique_channels:
-            try:
-                # Try to get chat info to cache the peer
-                await app.get_chat(chat_id)
-                count += 1
-            except Exception as e:
-                # If get_chat fails, try getting a member (alternative wake-up call)
-                try:
-                    await app.get_chat_member(chat_id, app.me.id)
-                    count += 1
-                except:
-                    logger.warning(f"Failed to refresh cache for channel {chat_id}")
-            
-            await asyncio.sleep(0.3) # Sleep to avoid FloodWait
-                
-        print(f"✅ Successfully Refreshed {count} Additional Channels!")
         
     except Exception as e:
         logger.error(f"Channel Refresh Logic Failed: {e}")
@@ -685,11 +657,13 @@ async def auto_broadcast_worker(movie_title, message_id, thumbnail_id=None):
 #                           BOT HANDLERS & COMMANDS
 # ==============================================================================
 
-# 1. AUTO SAVE FROM PRIMARY CHANNEL
-@app.on_message(filters.chat(CHANNEL_ID))
+# 1. AUTO SAVE FROM PRIMARY CHANNEL (UPDATED WITH FILENAME + EDIT SUPPORT)
+@app.on_message(filters.chat(CHANNEL_ID) & (filters.text | filters.media))
+@app.on_edited_message(filters.chat(CHANNEL_ID) & (filters.text | filters.media))
 async def save_post(_, msg: Message):
     title = await process_movie_save(msg)
-    if title:
+    # Broadcast only for NEW messages, not Edited ones
+    if title and not msg.edit_date:
         setting = await settings_col.find_one({"key": "global_notify"})
         if setting and setting.get("value", True):
             thumb = msg.photo.file_id if msg.photo else (msg.video.thumbs[0].file_id if msg.video and msg.video.thumbs else None)
@@ -704,32 +678,26 @@ async def log_group(_, msg: Message):
         upsert=True
     )
 
-# 3. MANUAL INDEXING COMMAND (For Multi-Channel) - FIXED & BATCH MODE
+# 3. MANUAL INDEXING COMMAND (Only for Main Channel Batch Index)
 @app.on_message(filters.command("index") & filters.user(ADMIN_IDS))
 async def index_channel_handler(_, msg: Message):
-    target_chat_id = None
-    
-    if msg.reply_to_message and msg.reply_to_message.forward_from_chat:
-        target_chat_id = msg.reply_to_message.forward_from_chat.id
-    elif len(msg.command) > 1:
-        try: target_chat_id = int(msg.command[1])
-        except: pass
+    # Only index the configured CHANNEL_ID to avoid confusion
+    target_chat_id = CHANNEL_ID
 
     if not target_chat_id:
-        return await msg.reply("❌ চ্যানেল আইডি পাওয়া যায়নি। সঠিক নিয়ম: `/index -100xxxx` অথবা চ্যানেল থেকে ফরোয়ার্ড করা মেসেজে রিপ্লাই দিন।")
+        return await msg.reply("❌ কনফিগ ভেরিয়েবলে CHANNEL_ID সেট করা নেই!")
 
     try:
         check_msg = await app.send_message(target_chat_id, "⚠️ **Indexing Logic initialized...**")
         last_msg_id = check_msg.id
         await check_msg.delete()
     except Exception as e:
-        return await msg.reply(f"❌ **Error:** বট ওই চ্যানেলে মেসেজ পাঠাতে পারছে না। বটকে অবশ্যই **Admin** হতে হবে।\nError: {e}")
+        return await msg.reply(f"❌ **Error:** বট চ্যানেলে মেসেজ পাঠাতে পারছে না। বটকে অবশ্যই Admin হতে হবে।\nError: {e}")
 
-    status_msg = await msg.reply(f"⏳ **Indexing Started...**\n🎯 Target: `{target_chat_id}`\n🔢 Last ID: `{last_msg_id}`\n🚀 Speed: `Safe Mode`")
+    status_msg = await msg.reply(f"⏳ **Indexing Started for Main Channel...**\n🎯 Target: `{target_chat_id}`\n🔢 Last ID: `{last_msg_id}`\n🚀 Speed: `Safe Mode`")
     
     total_indexed = 0
     total_skipped = 0
-    already_exists = 0
     batch_size = 100
     
     try:
@@ -756,11 +724,6 @@ async def index_channel_handler(_, msg: Message):
                         continue
                         
                     try:
-                        exists = await movies_col.find_one({"chat_id": target_chat_id, "message_id": message.id})
-                        if exists:
-                            already_exists += 1
-                            continue
-
                         saved_title = await process_movie_save(message)
                         if saved_title: 
                             total_indexed += 1
@@ -776,9 +739,8 @@ async def index_channel_handler(_, msg: Message):
                         await status_msg.edit_text(
                             f"⏳ **Indexing Running...**\n"
                             f"📡 Scanning IDs: {start_id} ➝ {end_id}\n"
-                            f"✅ Saved: {total_indexed}\n"
-                            f"♻️ Already Exists: {already_exists}\n"
-                            f"⏭ Skipped (No Text/Media): {total_skipped}"
+                            f"✅ Saved/Updated: {total_indexed}\n"
+                            f"⏭ Skipped (Empty/Short): {total_skipped}"
                         )
                     except: pass
                     
@@ -792,15 +754,14 @@ async def index_channel_handler(_, msg: Message):
     await status_msg.edit_text(
         f"✅ **Indexing Completed!**\n"
         f"📂 চ্যানেল: `{target_chat_id}`\n"
-        f"💾 নতুন সেভ হয়েছে: **{total_indexed}** টি\n"
-        f"♻️ আগে থেকেই ছিল: **{already_exists}** টি\n"
+        f"💾 টোটাল সেভ/আপডেট: **{total_indexed}** টি\n"
         f"🗑 বাদ দেওয়া হয়েছে: **{total_skipped}** টি"
     )
 
 # 4. START COMMAND (Logic Hub) with RETRY LOGIC
 user_last_start_time = {}
 
-# --- HELPER FUNCTION FOR SAFE COPY (NEW FIX) ---
+# --- HELPER FUNCTION FOR SAFE COPY ---
 async def safe_copy_message(chat_id, from_chat_id, message_id, protect_content):
     """
     Attempts to copy a message. If it fails due to PeerIdInvalid,
@@ -880,7 +841,7 @@ async def start(_, msg: Message):
                 return
 
             message_id = verify_data["movie_id"]
-            # Fix: Use .get() default to CHANNEL_ID if key missing in old verify data (rare but safe)
+            # Fix: Use .get() default to CHANNEL_ID if key missing in old verify data
             source_chat_id = verify_data.get("chat_id", CHANNEL_ID)
 
             # --- USE SAFE COPY FUNCTION HERE ---
@@ -909,7 +870,7 @@ async def start(_, msg: Message):
             message_id = int(argument.replace("watch_", ""))
             
             movie = await movies_col.find_one({"message_id": message_id})
-            # Fix: Use .get() to avoid KeyError if 'chat_id' is missing in old documents
+            # Fix: Use .get() to avoid KeyError if 'chat_id' is missing
             source_chat_id = movie.get("chat_id", CHANNEL_ID) if movie else CHANNEL_ID
 
             verify_setting = await settings_col.find_one({"key": "verification_mode"})
@@ -1498,7 +1459,7 @@ async def callback_handler(_, cq: CallbackQuery):
 # ==============================================================================
 
 if __name__ == "__main__":
-    print("🚀 Bot Started (Version 5.7 with Auto Retry & Refresh)...")
+    print("🚀 Bot Started (Version 6.0 - Ultimate Edition)...")
     
     # Start Flask in a separate thread
     Thread(target=run_flask).start()
@@ -1514,8 +1475,7 @@ if __name__ == "__main__":
         # 2. Start Auto Messenger
         asyncio.create_task(auto_group_messenger())
         
-        # 3. CRITICAL: Refresh Channel Cache on Startup
-        # This fixes the "PeerIdInvalid" or "File Not Found" issue after restart
+        # 3. CRITICAL: Refresh Main Channel Cache
         await refresh_channel_cache()
         
         print("✅ Bot is now fully operational!")
