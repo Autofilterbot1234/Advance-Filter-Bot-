@@ -2,7 +2,7 @@
 # ----------------------------------------------------
 # Developed by: Ctgmovies23
 # Project: TGLinkBase Auto Filter Bot (Ultimate Edition)
-# Version: 5.1 (Fixed Indexing & Link Post Support)
+# Version: 5.5 (Full Features + Advanced UI + Pagination)
 # Features:
 #   - Auto Filter (MongoDB)
 #   - Multi-Channel Indexing (ID Batch Fetching)
@@ -13,6 +13,8 @@
 #   - Auto Broadcast & Group Messenger
 #   - Smart Search (TMDB + Spelling Correction)
 #   - Supports Direct Files & Poster Link Posts
+#   - UI: Quality, Language, Season Buttons
+#   - UI: Page Navigation (1/130, Next, Back)
 # ----------------------------------------------------
 #
 
@@ -521,6 +523,82 @@ def find_corrected_matches(query_clean, all_movie_titles_data, score_cutoff=80, 
                     
     return sorted(corrected_suggestions, key=lambda x: x["score"], reverse=True)
 
+# Helper function to consolidate search logic and allow Pagination
+async def get_search_results(query, offset=0):
+    """
+    Executes the search logic (Regex > TMDB > Fuzzy).
+    Returns (results_list, total_count, search_source, cleaned_query, tmdb_detected_title)
+    """
+    raw_year = extract_year(query)
+    cleaned_query = smart_search_clean(query)
+    if not cleaned_query: cleaned_query = query.lower()
+
+    search_source = ""
+    results = []
+    total_count = 0
+
+    # 1. Direct Regex Search
+    regex_pattern = r"\b" + re.escape(cleaned_query) + r"\b"
+    query_filter = {
+        "$or": [
+            {"title_clean": {"$regex": regex_pattern, "$options": "i"}},
+            {"title": {"$regex": regex_pattern, "$options": "i"}}
+        ]
+    }
+    if raw_year: query_filter["year"] = raw_year
+    
+    # Get total count first for pagination
+    total_count = await movies_col.count_documents(query_filter)
+    
+    if total_count > 0:
+        cursor = movies_col.find(query_filter).sort("views_count", -1).skip(offset).limit(RESULTS_COUNT)
+        results = await cursor.to_list(length=RESULTS_COUNT)
+    
+    # 2. Loose Search (if no direct results found)
+    if not results and not raw_year:
+        loose_pattern = re.escape(cleaned_query)
+        loose_filter = {"title_clean": {"$regex": loose_pattern, "$options": "i"}}
+        
+        total_count = await movies_col.count_documents(loose_filter)
+        
+        if total_count > 0:
+            cursor = movies_col.find(loose_filter).sort("views_count", -1).skip(offset).limit(RESULTS_COUNT)
+            results = await cursor.to_list(length=RESULTS_COUNT)
+
+    # 3. TMDB Search (if still no results, check TMDB)
+    # We only check TMDB on the first page (offset=0) to avoid repeated API calls
+    tmdb_detected_title = None
+    if not results and offset == 0: 
+        tmdb_detected_title = await get_tmdb_suggestion(cleaned_query)
+        if tmdb_detected_title:
+            tmdb_clean = clean_text(tmdb_detected_title)
+            tmdb_filter = {
+                "$or": [
+                    {"title_clean": {"$regex": re.escape(tmdb_clean), "$options": "i"}},
+                    {"title": {"$regex": re.escape(tmdb_detected_title), "$options": "i"}}
+                ]
+            }
+            total_count = await movies_col.count_documents(tmdb_filter)
+            if total_count > 0:
+                cursor = movies_col.find(tmdb_filter).sort("views_count", -1).limit(RESULTS_COUNT)
+                results = await cursor.to_list(length=RESULTS_COUNT)
+                search_source = f"✅ **Auto Corrected:** '{tmdb_detected_title}'"
+
+    # 4. Fuzzy Search (Last Resort - Spelling Correction)
+    if not results and not raw_year and not tmdb_detected_title and offset == 0:
+        # Fetch minimal data for fuzzy matching to reduce RAM usage
+        all_movie_data = await movies_col.find({}, {"title_clean": 1, "original_title": "$title", "message_id": 1, "views_count": 1, "language": 1}).to_list(length=None)
+        
+        corrected_suggestions = await asyncio.get_event_loop().run_in_executor(
+            thread_pool_executor, find_corrected_matches, cleaned_query, all_movie_data, 80, RESULTS_COUNT
+        )
+        if corrected_suggestions:
+            results = corrected_suggestions
+            total_count = len(results)
+            search_source = f"🤔 আপনি কি **{corrected_suggestions[0]['title']}** খুঁজছেন?"
+
+    return results, total_count, search_source, cleaned_query, tmdb_detected_title
+
 # ==============================================================================
 #                           CORE LOGIC: SAVING & BROADCAST
 # ==============================================================================
@@ -587,6 +665,7 @@ async def process_movie_save(message):
     return None
 
 async def auto_group_messenger():
+    """ Sends auto messages to all groups every 20 minutes """
     print("✅ Auto Group Messenger Service Started...")
     while True:
         try:
@@ -609,6 +688,7 @@ async def auto_group_messenger():
         await asyncio.sleep(AUTO_MSG_INTERVAL)
 
 async def broadcast_messages(cursor, message_func, status_msg=None, total_users=0):
+    """ Robust Broadcast Function with Progress Bar """
     success = 0
     failed = 0
     start_time = time.time()
@@ -685,6 +765,7 @@ async def broadcast_messages(cursor, message_func, status_msg=None, total_users=
         except: pass
 
 async def auto_broadcast_worker(movie_title, message_id, thumbnail_id=None):
+    """ Automatically notifies all users when a new movie is added """
     download_link = f"https://t.me/{app.me.username}?start=watch_{message_id}"
     
     download_button = InlineKeyboardMarkup([
@@ -1155,6 +1236,8 @@ async def search(_, msg: Message):
         if query.startswith("/"): return
 
     user_id = msg.from_user.id
+    
+    # Save the query for pagination later (Important for "Next" button)
     await users_col.update_one(
         {"_id": user_id},
         {"$set": {"last_query": query}, "$setOnInsert": {"joined": datetime.now(timezone.utc)}},
@@ -1163,67 +1246,19 @@ async def search(_, msg: Message):
 
     loading_message = await msg.reply("🔎 <b>Searching...</b>", quote=True)
     
-    raw_year = extract_year(query)
-    cleaned_query = smart_search_clean(query)
-    if not cleaned_query: cleaned_query = query.lower()
-
-    search_source = ""
-    results = []
-    
-    # 1. Direct Regex Search
-    regex_pattern = r"\b" + re.escape(cleaned_query) + r"\b"
-    query_filter = {
-        "$or": [
-            {"title_clean": {"$regex": regex_pattern, "$options": "i"}},
-            {"title": {"$regex": regex_pattern, "$options": "i"}}
-        ]
-    }
-    if raw_year: query_filter["year"] = raw_year
-    
-    db_cursor = movies_col.find(query_filter).sort("views_count", -1).limit(RESULTS_COUNT)
-    results = await db_cursor.to_list(length=RESULTS_COUNT)
-
-    # 2. Loose Search
-    if not results and not raw_year:
-        loose_pattern = re.escape(cleaned_query)
-        db_cursor = movies_col.find({
-            "title_clean": {"$regex": loose_pattern, "$options": "i"}
-        }).sort("views_count", -1).limit(RESULTS_COUNT)
-        results = await db_cursor.to_list(length=RESULTS_COUNT)
-
-    # 3. TMDB Search
-    tmdb_detected_title = None
-    if not results:
-        tmdb_detected_title = await get_tmdb_suggestion(cleaned_query)
-        if tmdb_detected_title:
-            tmdb_clean = clean_text(tmdb_detected_title)
-            db_cursor = movies_col.find({
-                "$or": [
-                    {"title_clean": {"$regex": re.escape(tmdb_clean), "$options": "i"}},
-                    {"title": {"$regex": re.escape(tmdb_detected_title), "$options": "i"}}
-                ]
-            }).sort("views_count", -1).limit(RESULTS_COUNT)
-            results = await db_cursor.to_list(length=RESULTS_COUNT)
-            if results: search_source = f"✅ **Auto Corrected:** '{tmdb_detected_title}'"
-
-    # 4. Fuzzy Search (Spelling Correction)
-    if not results and not raw_year and not tmdb_detected_title:
-        all_movie_data = await movies_col.find({}, {"title_clean": 1, "original_title": "$title", "message_id": 1, "views_count": 1, "language": 1}).to_list(length=None)
-        corrected_suggestions = await asyncio.get_event_loop().run_in_executor(
-            thread_pool_executor, find_corrected_matches, cleaned_query, all_movie_data, 80, RESULTS_COUNT
-        )
-        if corrected_suggestions:
-            results = corrected_suggestions
-            search_source = f"🤔 আপনি কি **{corrected_suggestions[0]['title']}** খুঁজছেন?"
+    # Use helper function to fetch results (Page 0 by default)
+    results, total_count, search_source, cleaned_query, tmdb_detected_title = await get_search_results(query, offset=0)
 
     # Found Results?
     if results:
         await loading_message.delete()
         header_text = f"🎬 **আপনার মুভি পাওয়া গেছে:**\n{search_source}" if search_source else "🎬 **আপনার মুভি পাওয়া গেছে:**"
-        await send_results(msg, results, header_text)
+        
+        # Send results with the buttons you asked for
+        await send_results(msg, results, total_count, offset=0, header=header_text)
         return
 
-    # Not Found
+    # Not Found Logic
     await loading_message.delete()
     final_query = tmdb_detected_title if tmdb_detected_title else cleaned_query
     encoded_final_query = urllib.parse.quote_plus(final_query)
@@ -1235,8 +1270,8 @@ async def search(_, msg: Message):
     alert_text = (
         f"❌ **'{query}'** পাওয়া যায়নি।\n"
         f"💡 **আপনি কি এটি খুঁজছিলেন?** 👉 **{tmdb_detected_title}**\n\n"
-        f"রিকোয়েস্ট করতে নিচের বাটনে ক্লিক করুন।"
-    ) if tmdb_detected_title else f"❌ দুঃখিত! **'{cleaned_query}'** পাওয়া যায়নি।"
+        f"রিকোয়েস্ট করতে নিচের বাটনে ক্লিক করুন。"
+    ) if tmdb_detected_title else f"❌ দুঃখিত! **'{cleaned_query}'** পাওয়া যায়নি。"
 
     alert = await msg.reply_text(alert_text, reply_markup=InlineKeyboardMarkup([[req_btn], [google_btn]]), quote=True)
     asyncio.create_task(delete_message_later(alert.chat.id, alert.id))
@@ -1271,14 +1306,20 @@ async def search(_, msg: Message):
         except Exception:
             pass
 
-async def send_results(msg, results, header="🎬 আপনার মুভি পাওয়া গেছে:"):
+async def send_results(msg, results, total_count, offset=0, header="🎬 আপনার মুভি পাওয়া গেছে:"):
+    """ This function handles the button layout for search results """
+    
     # Check Settings
     setting = await settings_col.find_one({"key": "verification_mode"})
     is_verify_on = setting.get("value", True) if setting else True
     
     buttons = []
-    user_id = msg.from_user.id
-    
+    # Identify user ID correctly based on message type
+    user_id = msg.chat.id
+    if msg.from_user:
+        user_id = msg.from_user.id
+
+    # 1. MOVIE LIST BUTTONS
     for movie in results:
         title = movie.get('title') or movie.get('original_title')
         mid = movie['message_id']
@@ -1297,12 +1338,52 @@ async def send_results(msg, results, header="🎬 আপনার মুভি �
                 url=link
             )
         ])
+
+    # 2. FILTER BUTTONS (As requested in Screenshot)
+    # These buttons will appear after the movie list
+    buttons.append([
+        InlineKeyboardButton("QUALITY", callback_data="filter_quality"),
+        InlineKeyboardButton("LANGUAGE", callback_data="filter_lang"),
+        InlineKeyboardButton("SEASON", callback_data="filter_season")
+    ])
+
+    # 3. PAGINATION BUTTONS (As requested in Screenshot)
+    # Logic to show: [< Back] [1/130] [Next >]
+    pagination_buttons = []
     
+    # Calculate pages
+    current_page = (offset // RESULTS_COUNT) + 1
+    total_pages = math.ceil(total_count / RESULTS_COUNT)
+    
+    # Back Button
+    if offset > 0:
+        pagination_buttons.append(InlineKeyboardButton("< Back", callback_data=f"prev_page_{offset}"))
+    else:
+        pagination_buttons.append(InlineKeyboardButton("PAGE", callback_data="ignore"))
+
+    # Page Number Button (Active)
+    pagination_buttons.append(InlineKeyboardButton(f"{current_page}/{total_pages}", callback_data="ignore"))
+
+    # Next Button
+    if (offset + RESULTS_COUNT) < total_count:
+        pagination_buttons.append(InlineKeyboardButton("NEXT >", callback_data=f"next_page_{offset}"))
+    else:
+        pagination_buttons.append(InlineKeyboardButton("END", callback_data="ignore"))
+
+    buttons.append(pagination_buttons)
+
     footer = "👇 নিচের লিংকে ক্লিক করে ভেরিফাই করুন:" if is_verify_on else "👇 ডাউনলোড করতে ক্লিক করুন:"
     final_text = f"{header}\n{footer}"
     
-    m = await msg.reply(final_text, reply_markup=InlineKeyboardMarkup(buttons), quote=True)
-    asyncio.create_task(delete_message_later(m.chat.id, m.id))
+    # If called from a callback (msg is Message object), edit it. If from text, reply.
+    try:
+        if isinstance(msg, Message) and msg.via_bot: # It's an update to existing bot msg
+             await msg.edit_text(final_text, reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+             m = await msg.reply(final_text, reply_markup=InlineKeyboardMarkup(buttons), quote=True)
+             asyncio.create_task(delete_message_later(m.chat.id, m.id))
+    except Exception as e:
+        logger.error(f"Send Results Error: {e}")
 
 # ==============================================================================
 #                           CALLBACK HANDLER
@@ -1387,6 +1468,38 @@ async def callback_handler(_, cq: CallbackQuery):
             buttons.append([InlineKeyboardButton("🔙 Back", callback_data="home_menu")])
             
             await cq.message.edit_caption(caption=msg_text, reply_markup=InlineKeyboardMarkup(buttons))
+
+        # --- PAGINATION & FILTERS HANDLER ---
+        elif data.startswith("next_page_") or data.startswith("prev_page_"):
+            # Get User's Last Query from DB
+            user_data = await users_col.find_one({"_id": user_id})
+            if not user_data or "last_query" not in user_data:
+                await cq.answer("⚠️ সেশন এক্সপায়ার হয়েছে। আবার সার্চ করুন।", show_alert=True)
+                return
+            
+            last_query = user_data["last_query"]
+            current_offset = int(data.split("_")[2])
+            
+            # Calculate new offset
+            if "next" in data:
+                new_offset = current_offset + RESULTS_COUNT
+            else:
+                new_offset = max(0, current_offset - RESULTS_COUNT)
+            
+            # Fetch new results
+            results, total_count, _, _, _ = await get_search_results(last_query, offset=new_offset)
+            
+            if results:
+                await send_results(cq.message, results, total_count, offset=new_offset, header=f"🔎 ফলাফল: **{last_query}**")
+            else:
+                await cq.answer("⚠️ আর কোনো ফলাফল নেই!", show_alert=True)
+
+        elif data in ["filter_quality", "filter_lang", "filter_season"]:
+            # Placeholder for filters (requires more complex DB query in future)
+            await cq.answer("🛠 Filter feature coming soon!", show_alert=True)
+            
+        elif data == "ignore":
+            await cq.answer()
 
         elif data.startswith("report_"):
             await cq.answer("Report Sent!", show_alert=True)
@@ -1510,7 +1623,7 @@ async def callback_handler(_, cq: CallbackQuery):
         logger.error(f"Callback Error: {e}")
 
 if __name__ == "__main__":
-    print("🚀 Bot Started (Ultimate Version)...")
+    print("🚀 Bot Started (Ultimate Version with Pagination)...")
     Thread(target=run_flask).start() # Start Flask Web Server
     app.loop.create_task(init_settings()) # Init Settings
     app.loop.create_task(auto_group_messenger()) # Start Auto Msg
