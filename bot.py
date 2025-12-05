@@ -2,7 +2,7 @@
 # ----------------------------------------------------
 # Developed by: Ctgmovies23
 # Project: TGLinkBase Auto Filter Bot (Ultimate Edition)
-# Version: 5.5 (Added: Auto Channel Cache Refresh on Startup)
+# Version: 5.6 (Fix: PeerIdInvalid & Auto Channel Refresh)
 # Features:
 #   - Auto Filter (MongoDB)
 #   - Multi-Channel Indexing (ID Batch Fetching)
@@ -14,6 +14,7 @@
 #   - Smart Search (TMDB + Spelling Correction)
 #   - Supports Direct Files & Poster Link Posts
 #   - Startup Cache Refresh (Fixes 'File Not Found' after Restart)
+#   - Auto Retry Logic for Forwarding
 # ----------------------------------------------------
 #
 
@@ -508,29 +509,44 @@ async def refresh_channel_cache():
     """
     print("🔄 Refreshing Channel Cache (Fixing 'File Not Found' issue)...")
     try:
-        # Get all unique chat_ids from database
+        # 1. Force Refresh Main Channel First
+        if CHANNEL_ID:
+            try:
+                await app.get_chat(CHANNEL_ID)
+                print(f"✅ Main Channel ({CHANNEL_ID}) Refreshed!")
+            except Exception as e:
+                logger.warning(f"⚠️ Main Channel Refresh Failed: {e}")
+
+        # 2. Refresh Other Indexed Channels
         pipeline = [{"$group": {"_id": "$chat_id"}}]
-        # Depending on motor version, aggregate returns a cursor
         cursor = movies_col.aggregate(pipeline)
         
         unique_channels = []
         async for doc in cursor:
-            unique_channels.append(doc["_id"])
+            chat_id = doc["_id"]
+            if chat_id != CHANNEL_ID: # Avoid double checking main channel
+                unique_channels.append(chat_id)
         
         count = 0
         for chat_id in unique_channels:
             try:
-                # Just getting the chat is enough to cache the peer
+                # Try to get chat info to cache the peer
                 await app.get_chat(chat_id)
                 count += 1
-                await asyncio.sleep(0.5) # Slight delay to avoid floodwait
             except Exception as e:
-                logger.warning(f"Failed to refresh cache for channel {chat_id}: {e}")
+                # If get_chat fails, try getting a member (alternative wake-up call)
+                try:
+                    await app.get_chat_member(chat_id, app.me.id)
+                    count += 1
+                except:
+                    logger.warning(f"Failed to refresh cache for channel {chat_id}")
+            
+            await asyncio.sleep(0.3) # Sleep to avoid FloodWait
                 
-        print(f"✅ Successfully Refreshed {count} Channels!")
+        print(f"✅ Successfully Refreshed {count} Additional Channels!")
         
     except Exception as e:
-        logger.error(f"Channel Refresh Failed: {e}")
+        logger.error(f"Channel Refresh Logic Failed: {e}")
 
 async def auto_group_messenger():
     print("✅ Auto Group Messenger Service Started...")
@@ -775,8 +791,43 @@ async def index_channel_handler(_, msg: Message):
         f"🗑 বাদ দেওয়া হয়েছে: **{total_skipped}** টি"
     )
 
-# 4. START COMMAND (Logic Hub)
+# 4. START COMMAND (Logic Hub) with RETRY LOGIC
 user_last_start_time = {}
+
+# --- HELPER FUNCTION FOR SAFE COPY (NEW FIX) ---
+async def safe_copy_message(chat_id, from_chat_id, message_id, protect_content):
+    """
+    Attempts to copy a message. If it fails due to PeerIdInvalid,
+    it refreshes the cache and retries.
+    """
+    try:
+        # First Try
+        await app.copy_message(
+            chat_id=chat_id,
+            from_chat_id=from_chat_id,
+            message_id=message_id,
+            protect_content=protect_content
+        )
+        return True
+    except (ChannelInvalid, PeerIdInvalid):
+        # If failed, Refresh Cache and Retry
+        try:
+            print(f"⚠️ Channel {from_chat_id} not found in cache. Refreshing...")
+            await app.get_chat(from_chat_id) # Force Refresh
+            await asyncio.sleep(0.5)
+            await app.copy_message(
+                chat_id=chat_id,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+                protect_content=protect_content
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Retry Failed for {from_chat_id}: {e}")
+            return False
+    except Exception as e:
+        logger.error(f"Copy Error: {e}")
+        return False
 
 @app.on_message(filters.command("start"))
 async def start(_, msg: Message):
@@ -826,14 +877,15 @@ async def start(_, msg: Message):
             # Fix: Use .get() default to CHANNEL_ID if key missing in old verify data (rare but safe)
             source_chat_id = verify_data.get("chat_id", CHANNEL_ID)
 
-            try:
-                await app.copy_message(
-                    chat_id=msg.chat.id,        
-                    from_chat_id=source_chat_id,    
-                    message_id=message_id,      
-                    protect_content=should_protect 
-                )
-                
+            # --- USE SAFE COPY FUNCTION HERE ---
+            success = await safe_copy_message(
+                chat_id=msg.chat.id,        
+                from_chat_id=source_chat_id,    
+                message_id=message_id,      
+                protect_content=should_protect 
+            )
+            
+            if success:
                 await verify_col.delete_one({"token": token})
                 await movies_col.update_one({"message_id": message_id}, {"$inc": {"views_count": 1}})
                 
@@ -842,9 +894,8 @@ async def start(_, msg: Message):
                 ])
                 suc_msg = await msg.reply("✅ **ভেরিফিকেশন সফল!**\nআপনার ফাইল উপরে দেওয়া হয়েছে।", reply_markup=action_buttons)
                 asyncio.create_task(delete_message_later(suc_msg.chat.id, suc_msg.id, 60))
-                
-            except Exception as e:
-                await msg.reply(f"❌ মুভিটি খুঁজে পাওয়া যাচ্ছে না। Error: {e}")
+            else:
+                await msg.reply(f"❌ মুভিটি খুঁজে পাওয়া যাচ্ছে না (File Missing or Channel Error).")
             return
             
         # --- B. DIRECT/NOTIFICATION LINK HANDLER ---
@@ -868,15 +919,17 @@ async def start(_, msg: Message):
                 )
                 return
             
-            try:
-                await app.copy_message(
-                    chat_id=msg.chat.id,
-                    from_chat_id=source_chat_id,
-                    message_id=message_id,
-                    protect_content=should_protect
-                )
+            # --- USE SAFE COPY FUNCTION HERE ---
+            success = await safe_copy_message(
+                chat_id=msg.chat.id,
+                from_chat_id=source_chat_id,
+                message_id=message_id,
+                protect_content=should_protect
+            )
+            
+            if success:
                 await movies_col.update_one({"message_id": message_id}, {"$inc": {"views_count": 1}})
-            except:
+            else:
                 await msg.reply("❌ ফাইলটি পাওয়া যাচ্ছে না।")
             return
 
@@ -1439,7 +1492,7 @@ async def callback_handler(_, cq: CallbackQuery):
 # ==============================================================================
 
 if __name__ == "__main__":
-    print("🚀 Bot Started (Version 5.5 with Startup Refresh)...")
+    print("🚀 Bot Started (Version 5.6 with Auto Retry & Refresh)...")
     
     # Start Flask in a separate thread
     Thread(target=run_flask).start()
